@@ -1,0 +1,25 @@
+{
+  "name": "@atc-web/notify",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Notification service: queued email and signed webhook delivery over HTTP",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/index.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch --env-file=.env src/index.js",
+    "test": "node --disable-warning=ExperimentalWarning --test \"test/**/*.test.js\"",
+    "typecheck": "tsc -p jsconfig.json"
+  },
+  "dependencies": {
+    "@fastify/rate-limit": "11.2.0",
+    "fastify": "5.12.4",
+    "nodemailer": "10.0.10"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.3",
+    "@types/nodemailer": "8.0.2",
+    "typescript": "7.0.2"
+  }
+}
