@@ -3,4 +3,5 @@ data
 test
 .env
 *.md
+LICENSE
 ecosystem.config.cjs

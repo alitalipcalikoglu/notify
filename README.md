@@ -148,3 +148,7 @@ Class-based; dependencies are injected through constructors, `src/application.js
 - SMS and push channels: these need a provider account; add a channel module next to `src/channels/` when one is chosen.
 - Attachments: the service sends templated messages only. Send a link instead.
 - Multiple worker processes on one SQLite file: claims are atomic, so it works, but the intended deployment is one instance per database. Move to Postgres if you need horizontal scaling.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
