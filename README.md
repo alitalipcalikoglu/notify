@@ -46,6 +46,10 @@ Callers reach the service over HTTPS with a bearer key. Two options:
 
 Firewall the port to the hosts that call it. Give each calling service its own entry in `NOTIFY_API_KEYS` so keys can be rotated one at a time. Callers configure `NOTIFY_URL` and `NOTIFY_API_KEY` in their own environment.
 
+## Examples
+
+Scenario walkthroughs for every feature live in [examples/](examples/README.md).
+
 ## Configuration
 
 All settings come from environment variables and are validated at startup; the process exits with a clear message on a bad value. See [.env.example](.env.example) for the full list and defaults.
