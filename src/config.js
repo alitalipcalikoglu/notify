@@ -47,6 +47,7 @@ export class Config {
     this.heartbeatMs = values.heartbeatMs;
     this.retentionDays = values.retentionDays;
     this.rateLimitMax = values.rateLimitMax;
+    this.webhookChannelEnabled = values.webhookChannelEnabled;
     Object.freeze(this);
   }
 
@@ -125,6 +126,9 @@ export class Config {
       heartbeatMs,
       retentionDays: r.integer('RETENTION_DAYS', 30, { min: 1 }),
       rateLimitMax: r.integer('RATE_LIMIT_MAX', 600, { min: 1 }),
+      // Stage 7: the webhook channel is legacy (README "Boundaries") — this lets an operator turn
+      // it off without touching email. Default true keeps every existing deployment unchanged.
+      webhookChannelEnabled: r.boolean('NOTIFY_WEBHOOK_CHANNEL', true),
     });
   }
 

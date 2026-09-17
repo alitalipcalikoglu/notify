@@ -53,6 +53,12 @@ test('Config: externalCallCeiling < drainMs < forceExitMs across the whole WEBHO
   }
 });
 
+test('Config: NOTIFY_WEBHOOK_CHANNEL defaults true (backward compatible), parses explicit true/false (Stage 7)', () => {
+  assert.equal(loadConfig(fullEnv()).webhookChannelEnabled, true);
+  assert.equal(loadConfig({ ...fullEnv(), NOTIFY_WEBHOOK_CHANNEL: 'true' }).webhookChannelEnabled, true);
+  assert.equal(loadConfig({ ...fullEnv(), NOTIFY_WEBHOOK_CHANNEL: 'false' }).webhookChannelEnabled, false);
+});
+
 function fullEnv() {
   return {
     NOTIFY_API_KEYS: `a:${'x'.repeat(40)}`, SMTP_URL: 'json:', SMTP_FROM: 'x@y.z', WEBHOOK_SIGNING_SECRET: 'w'.repeat(40),

@@ -3,8 +3,9 @@ import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
 import { AuditClient } from '@atc-web/service-core/audit';
-import { registerProbes } from '@atc-web/service-core/fastify';
+import { registerInfo, registerProbes } from '@atc-web/service-core/fastify';
 import { ApiKeyAuth } from './auth.js';
+import { DisabledChannel } from './channels/disabled.js';
 import { IdempotencyConflictError, InvalidCursorError } from './queue.js';
 
 /** @typedef {import('./config.js').Config} Config */
@@ -153,16 +154,18 @@ export class NotifyApi {
    * @param {import('./heartbeat-store.js').HeartbeatStore} deps.presence
    * @param {TemplateRegistry} deps.templates
    * @param {AnyChannel[]} deps.channels   Probed by `/ready`.
+   * @param {string} deps.version
    * @param {import('./types.js').Logger} [deps.logger]
    * @param {import('@atc-web/service-core/audit').AuditClient} [deps.audit]
    */
-  constructor({ config, audit, queue, presence, templates, channels, logger }) {
+  constructor({ config, audit, queue, presence, templates, channels, version, logger }) {
     this.config = config;
     this.audit = audit;
     this.queue = queue;
     this.presence = presence;
     this.templates = templates;
     this.channels = channels;
+    this.version = version;
     this.logger = logger;
     this.auth = new ApiKeyAuth(config.apiKeys);
     /** @type {Map<string, DataValidator>} */
@@ -198,6 +201,15 @@ export class NotifyApi {
       this.queue.db.ping();
       for (const ch of this.channels) await ch.verify();
     }, { cacheMs: NotifyApi.READY_CACHE_MS, extra: () => ({ worker: this.workerStatus() }) });
+    registerInfo(app, {
+      service: 'notify',
+      version: this.version,
+      // Real, currently-enabled channels only — a DisabledChannel stand-in (Stage 7,
+      // NOTIFY_WEBHOOK_CHANNEL=false) is not a supported capability, so it's excluded here even
+      // though it's still present in `this.channels` for lookup/settlement purposes.
+      capabilities: [...this.channels.filter((ch) => !(ch instanceof DisabledChannel)).map((ch) => ch.name), 'templates', 'idempotency'],
+      schemaVersion: this.queue.db.schemaVersion,
+    });
     await app.register((api) => this.#registerV1(api), { prefix: '/v1' });
     await app.register((ops) => this.#registerMetrics(ops));
     return app;
@@ -279,6 +291,9 @@ export class NotifyApi {
   /** @type {import('fastify').RouteHandlerMethod} */
   #createMessage = async (request, reply) => {
     const { idempotencyKey, ...payload } = /** @type {any} */ (request.body);
+    if (payload.channel === 'webhook' && !this.config.webhookChannelEnabled) {
+      throw Object.assign(new Error('the webhook channel is disabled on this instance (NOTIFY_WEBHOOK_CHANNEL=false)'), { statusCode: 403, code: 'WEBHOOK_CHANNEL_DISABLED' });
+    }
     if (payload.channel === 'email') {
       const validate = this.dataValidators.get(payload.template);
       if (!validate) throw Object.assign(new Error(`unknown template "${payload.template}"`), { statusCode: 400, code: 'UNKNOWN_TEMPLATE' });

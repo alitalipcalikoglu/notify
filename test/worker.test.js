@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { after, before, test } from 'node:test';
+import { DisabledChannel } from '../src/channels/disabled.js';
 import { WebhookSigner } from '../src/channels/webhook.js';
 import { Worker } from '../src/worker.js';
 import { emailBody, silentLog, testConfig, testEmailChannel, testPresence, testQueue, testWebhookChannel, WEBHOOK_SECRET } from './helpers.js';
@@ -147,6 +148,25 @@ test('webhook to a private or disallowed host fails permanently without connecti
   assert.equal(queue.get(http.id, 'a')?.status, 'failed');
   assert.match(queue.get(http.id, 'a')?.last_error ?? '', /scheme/);
   assert.equal(received.length, 0);
+});
+
+test('DisabledChannel (NOTIFY_WEBHOOK_CHANNEL=false): a message already queued before the switch flipped settles to a deterministic terminal failure, not silently dropped or retried forever (Stage 7)', async () => {
+  const config = testConfig({ WEBHOOK_TIMEOUT_MS: '1000', LOCK_TTL_MS: '5000', HEARTBEAT_MS: '1000' });
+  const queue = testQueue(config);
+  const presence = testPresence();
+  const { channel: email } = testEmailChannel(config);
+  const worker = new Worker({
+    queue, presence, channels: [email, new DisabledChannel('webhook', 'NOTIFY_WEBHOOK_CHANNEL=false')], log: silentLog,
+    options: { concurrency: config.workerConcurrency, pollMs: config.workerPollMs, retentionDays: config.retentionDays, heartbeatMs: config.heartbeatMs, drainMs: 5_000 },
+  });
+  received.length = 0;
+  const { row } = queue.enqueue({ apiKeyId: 'a', channel: 'webhook', payload: webhookPayload('/ok') });
+  await worker.tick();
+  const after = queue.get(row.id, 'a');
+  assert.equal(after?.status, 'failed', 'deterministic terminal state, not stuck queued and not silently vanished');
+  assert.equal(after?.attempts, 1, 'costs exactly one attempt, no infinite retry loop');
+  assert.match(after?.last_error ?? '', /"webhook" channel is disabled \(NOTIFY_WEBHOOK_CHANNEL=false\)/);
+  assert.equal(received.length, 0, 'the disabled channel never makes the external call');
 });
 
 test('start/stop loop drains the queue and recovers stale processing rows', async () => {

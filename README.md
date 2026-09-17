@@ -37,6 +37,14 @@ npm test
 npm run typecheck
 ```
 
+## Boundaries
+
+**Purpose:** fire-and-forget delivery of transactional notifications — templated email, and a legacy one-off signed webhook — on behalf of other services.
+
+**Responsibilities:** template rendering; SMTP delivery with retry/backoff; a legacy signed-webhook channel for one-off calls (`NOTIFY_WEBHOOK_CHANNEL`, see below); idempotency-key dedup; per-message delivery status.
+
+**Non-responsibilities:** notify ≠ durable webhook platform. Its webhook channel is explicitly a legacy path for simple one-off calls — it has no subscription model, no secret rotation, no replay, no delivery history browsing beyond a single message's own status. New durable/retry-oriented webhook integrations belong in `webhook-out`, not here. Notify also does not manage recipient subscriptions or preferences — every send is caller-supplied, per message.
+
 ## Running on its own server
 
 Callers reach the service over HTTPS with a bearer key. Two options:
@@ -60,6 +68,7 @@ Required: `NOTIFY_API_KEYS`, `SMTP_URL`, `SMTP_FROM`, `WEBHOOK_SIGNING_SECRET`.
 - `SMTP_URL` is a nodemailer connection URL such as `smtps://user:pass@host:465`. `json:` logs mails instead of sending (development).
 - `TLS_CERT_PATH` / `TLS_KEY_PATH` enable native HTTPS; both or neither.
 - `WEBHOOK_ALLOWED_HOSTS` restricts webhook targets to the listed hosts and their subdomains. Leave empty to allow any public host.
+- `NOTIFY_WEBHOOK_CHANNEL` (default `true`) — turns the legacy signed-webhook channel off when set to `false`. Existing deployments are unaffected by default. When `false`: `POST /v1/messages` with `channel: "webhook"` is rejected with `403 WEBHOOK_CHANNEL_DISABLED` before it's queued; email is unaffected. Anything already `queued`/`processing` under the webhook channel at the moment it's disabled is still claimed by the worker on its normal schedule, but settles to a deterministic terminal `failed` (one attempt cost, no backoff, `last_error` names the reason) instead of attempting delivery or sitting stuck forever — never a silent drop, never an infinite retry loop. New durable/retry-oriented webhook integrations should use `webhook-out` instead of turning this back on.
 
 ## API
 
@@ -69,6 +78,7 @@ Every `/v1` and `/metrics` request needs `Authorization: Bearer <secret>`. Error
 |---|---|---|
 | GET | `/health` | Liveness. No auth. |
 | GET | `/ready` | Readiness: database and SMTP reachable (cached 30 s). No auth. |
+| GET | `/v1/info` | Service identity: version, API version, real capabilities, schema version, service-core version. No auth. |
 | POST | `/v1/messages` | Enqueue. `202` with the message, or `200` on an idempotent replay. |
 | GET | `/v1/messages` | List own messages, newest first. Query: `status`, `limit` (1-100), `cursor`. |
 | GET | `/v1/messages/:id` | Delivery status. |
@@ -94,6 +104,8 @@ Every `/v1` and `/metrics` request needs `Authorization: Bearer <secret>`. Error
 Adding a template: subclass `EmailTemplate` in `src/templates/<name>.js` (override `name`, `description`, `schema`, `subject()`, `layout()`) and add an instance in `TemplateRegistry.withDefaults()`. `layout()` returns plain strings; `Layout` escapes every value on output.
 
 ### Webhook
+
+**Legacy signed webhook for one-off calls.** This is a simple, one-shot signed POST, not a durable delivery platform — no subscriptions, no secret rotation, no replay, no per-endpoint delivery history. For anything durable/retry-oriented (recurring event delivery to external partners, subscription management, replay), use `webhook-out` instead. Can be turned off entirely with `NOTIFY_WEBHOOK_CHANNEL=false` (see Configuration) without affecting email.
 
 ```json
 {

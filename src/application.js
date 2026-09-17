@@ -1,7 +1,9 @@
 import { NotifyApi } from './app.js';
 import { AuditClient } from '@atc-web/service-core/audit';
+import { readServiceVersion } from '@atc-web/service-core/fastify';
 import { Lifecycle } from '@atc-web/service-core/lifecycle';
 import { ConsoleLogger } from '@atc-web/service-core/log';
+import { DisabledChannel } from './channels/disabled.js';
 import { EmailChannel } from './channels/email.js';
 import { WebhookChannel, WebhookSigner } from './channels/webhook.js';
 import { Config } from './config.js';
@@ -32,6 +34,7 @@ export class Application {
   constructor(config, { role = 'combined' } = {}) {
     this.config = config;
     this.role = role;
+    this.version = readServiceVersion(import.meta.url);
     this.audit = new AuditClient({ target: config.audit });
     this.db = new Database(config.dbPath, { backupDir: config.dbBackupDir });
     this.presence = new HeartbeatStore(this.db);
@@ -41,13 +44,22 @@ export class Application {
       backoff: new Backoff(config.backoffBaseMs, config.backoffCapMs),
     });
     this.templates = TemplateRegistry.withDefaults();
+    // Stage 7: the webhook channel is legacy (README "Boundaries") and can be turned off with
+    // NOTIFY_WEBHOOK_CHANNEL=false. Disabling it never removes the "webhook" entry from this
+    // array (Worker#channels is keyed by name and NotifyApi's capability list depends on being
+    // able to tell the two apart) — it swaps in a DisabledChannel stand-in instead, so any
+    // message a caller already queued under channel:webhook still gets claimed and settled to a
+    // clear, deterministic terminal failure (see DisabledChannel) rather than silently stuck or
+    // retried forever.
     this.channels = [
       new EmailChannel({ templates: this.templates, from: config.smtpFrom, smtpUrl: config.smtpUrl }),
-      new WebhookChannel({
-        signer: new WebhookSigner(config.webhookSigningSecret),
-        guard: new NetGuard({ allowHttp: config.webhookAllowHttp, allowedHosts: config.webhookAllowedHosts }),
-        timeoutMs: config.webhookTimeoutMs,
-      }),
+      config.webhookChannelEnabled
+        ? new WebhookChannel({
+          signer: new WebhookSigner(config.webhookSigningSecret),
+          guard: new NetGuard({ allowHttp: config.webhookAllowHttp, allowedHosts: config.webhookAllowedHosts }),
+          timeoutMs: config.webhookTimeoutMs,
+        })
+        : new DisabledChannel('webhook', 'NOTIFY_WEBHOOK_CHANNEL=false'),
     ];
     /** @type {import('fastify').FastifyInstance|null} */
     this.app = null;
@@ -101,7 +113,7 @@ export class Application {
     const steps = [];
 
     if (runsApi) {
-      const api = new NotifyApi({ config, audit: this.audit, queue: this.queue, presence: this.presence, templates: this.templates, channels: this.channels });
+      const api = new NotifyApi({ config, audit: this.audit, queue: this.queue, presence: this.presence, templates: this.templates, channels: this.channels, version: this.version });
       const app = await api.build();
       this.app = app;
       log = app.log;

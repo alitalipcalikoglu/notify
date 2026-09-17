@@ -37,6 +37,7 @@
  * @property {number} heartbeatMs          How often an in-flight delivery's lock is renewed; must be < lockTtlMs.
  * @property {number} retentionDays
  * @property {number} rateLimitMax         Requests per minute per API key.
+ * @property {boolean} webhookChannelEnabled `NOTIFY_WEBHOOK_CHANNEL`, default true; see README "Boundaries".
  */
 
 /** @typedef {import('./config.js').Config} Config */
