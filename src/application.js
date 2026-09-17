@@ -1,4 +1,5 @@
 import { NotifyApi } from './app.js';
+import { AuditClient } from './net/audit-client.js';
 import { EmailChannel } from './channels/email.js';
 import { WebhookChannel, WebhookSigner } from './channels/webhook.js';
 import { Config } from './config.js';
@@ -16,6 +17,7 @@ export class Application {
   /** @param {Config} config */
   constructor(config) {
     this.config = config;
+    this.audit = new AuditClient({ target: config.audit });
     this.db = new Database(config.dbPath);
     this.queue = new Queue(this.db, {
       maxAttempts: config.maxAttempts,
@@ -31,7 +33,7 @@ export class Application {
         timeoutMs: config.webhookTimeoutMs,
       }),
     ];
-    this.api = new NotifyApi({ config, queue: this.queue, templates: this.templates, channels: this.channels });
+    this.api = new NotifyApi({ config, audit: this.audit, queue: this.queue, templates: this.templates, channels: this.channels });
     /** @type {import('fastify').FastifyInstance|null} */
     this.app = null;
     /** @type {Worker|null} */
@@ -62,6 +64,8 @@ export class Application {
       options: { concurrency: this.config.workerConcurrency, pollMs: this.config.workerPollMs, retentionDays: this.config.retentionDays },
     });
     this.#installSignalHandlers(app.log);
+    this.audit.logger = app.log;
+    this.audit.start();
     await app.listen({ port: this.config.port, host: this.config.host });
     app.log.info({ tls: this.config.tls !== null }, this.config.tls ? 'serving HTTPS' : 'serving plain HTTP, terminate TLS at a reverse proxy');
     this.worker.start();
@@ -83,6 +87,7 @@ export class Application {
     }, this.config.lockTtlMs).unref();
     try {
       await this.app?.close();
+      await this.audit.close();
       await this.worker?.stop();
       for (const ch of this.channels) ch.close();
       this.db.close();

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
+import { AuditClient } from './net/audit-client.js';
 import { ApiKeyAuth } from './auth.js';
 import { InvalidCursorError } from './queue.js';
 
@@ -149,9 +150,11 @@ export class NotifyApi {
    * @param {TemplateRegistry} deps.templates
    * @param {AnyChannel[]} deps.channels   Probed by `/ready`.
    * @param {import('./types.js').Logger} [deps.logger]
+   * @param {import('./net/audit-client.js').AuditClient} [deps.audit]
    */
-  constructor({ config, queue, templates, channels, logger }) {
+  constructor({ config, audit, queue, templates, channels, logger }) {
     this.config = config;
+    this.audit = audit;
     this.queue = queue;
     this.templates = templates;
     this.channels = channels;
@@ -177,6 +180,7 @@ export class NotifyApi {
     });
     app.decorateRequest('apiKeyId', '');
     app.setErrorHandler(this.#errorHandler);
+    app.addHook('onSend', AuditClient.hook(this.audit));
     app.setNotFoundHandler((_request, reply) => {
       reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'route not found' } });
     });
@@ -251,7 +255,7 @@ export class NotifyApi {
     });
     api.addHook('onReady', async () => this.#compileDataValidators(api));
 
-    api.post('/messages', {
+    api.post('/messages', { config: { audit: AuditClient.route('notify.message.create', (_r, b) => ({ type: 'message', id: b.id }), (_r, b) => ({ channel: b?.channel, status: b?.status })) },
       schema: {
         body: {
           type: 'object',
@@ -265,7 +269,7 @@ export class NotifyApi {
 
     api.get('/messages', { schema: { querystring: Schemas.listQuery } }, this.#listMessages);
     api.get('/messages/:id', { schema: { params: Schemas.idParams, response: { 200: Schemas.message, 404: Schemas.error } } }, this.#getMessage);
-    api.post('/messages/:id/retry', {
+    api.post('/messages/:id/retry', { config: { audit: AuditClient.route('notify.message.retry', (r) => ({ type: 'message', id: /** @type {any} */ (r.params).id })) },
       schema: { params: Schemas.idParams, response: { 200: Schemas.message, 404: Schemas.error, 409: Schemas.error } },
     }, this.#retryMessage);
     api.get('/templates', async () => ({ items: this.templates.describe() }));

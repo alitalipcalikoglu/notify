@@ -5,4 +5,7 @@ declare module 'fastify' {
   interface FastifyRequest {
     apiKeyId: string;
   }
+  interface FastifyContextConfig {
+    audit?: import('./net/audit-client.js').AuditRouteConfig;
+  }
 }

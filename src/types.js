@@ -16,7 +16,8 @@
  * @property {string} host
  * @property {string} logLevel
  * @property {boolean} trustProxy
- * @property {{ certPath: string, keyPath: string }|null} tls  Serve HTTPS directly when set.
+ * @property {{ certPath: string, keyPath: string }|null} tls
+ * @property {{ url: string, apiKey: string }|null} audit   Audit service to forward events to; null = off.  Serve HTTPS directly when set.
  * @property {number} bodyLimit
  * @property {string} dbPath
  * @property {ApiKey[]} apiKeys

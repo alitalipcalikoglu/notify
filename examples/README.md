@@ -11,6 +11,7 @@ Scenario-driven walkthroughs of every feature. All requests need `Authorization:
 | [Templates and their schemas](templates.md) | Listing templates, validation errors, adding a template |
 | [Retries, failures and backoff](delivery-and-retries.md) | What counts as permanent vs. transient, backoff timing, crash recovery |
 | [Operations](operations.md) | Health, readiness, metrics, environment, PM2 and Docker |
+| [Audit events](audit-events.md) | Which write actions are forwarded to the audit service, event shape, configuration |
 
 Set up once for the examples:
 
