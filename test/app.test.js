@@ -1,17 +1,18 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import { NotifyApi } from '../src/app.js';
-import { API_KEY, emailBody, OTHER_KEY, silentLog, templates, testConfig, testEmailChannel, testQueue } from './helpers.js';
+import { API_KEY, emailBody, OTHER_KEY, silentLog, templates, testConfig, testEmailChannel, testPresence, testQueue } from './helpers.js';
 
 const config = testConfig({ RATE_LIMIT_MAX: '50' });
 const queue = testQueue(config);
+const presence = testPresence();
 /** @type {import('fastify').FastifyInstance} */
 let app;
 const auth = { authorization: `Bearer ${API_KEY}` };
 
 before(async () => {
   const { channel } = testEmailChannel(config);
-  app = await new NotifyApi({ config, queue, templates, channels: [channel], logger: silentLog }).build();
+  app = await new NotifyApi({ config, queue, presence, templates, channels: [channel], logger: silentLog }).build();
   await app.ready();
 });
 after(() => app.close());
@@ -20,7 +21,9 @@ test('health and readiness are public', async () => {
   assert.equal((await app.inject('/health')).statusCode, 200);
   const ready = await app.inject('/ready');
   assert.equal(ready.statusCode, 200);
-  assert.deepEqual(ready.json(), { status: 'ok' });
+  assert.deepEqual(ready.json(), { status: 'ok', worker: 'stopped' }, 'no worker_heartbeat row: reads as stopped, Stage 6');
+  presence.beat(Date.now());
+  assert.deepEqual((await app.inject('/ready')).json(), { status: 'ok', worker: 'running' }, 'a recent heartbeat reads as running even with no in-process Worker');
 });
 
 test('v1 routes require a valid bearer key', async () => {
@@ -98,6 +101,12 @@ test('POST /v1/messages queues, exposes status, honours idempotency and key scop
   assert.equal(replay.statusCode, 200);
   assert.equal(replay.json().id, msg.id);
 
+  // Stage 6: the same key with a DIFFERENT payload is a conflict, not a silent success with the
+  // stale original content — the key identifies one logical send.
+  const conflict = await app.inject({ method: 'POST', url: '/v1/messages', headers: auth, payload: { ...emailBody, idempotencyKey: 'order-42', to: ['different@example.com'] } });
+  assert.equal(conflict.statusCode, 409);
+  assert.equal(conflict.json().error.code, 'IDEMPOTENCY_CONFLICT');
+
   const get = await app.inject({ url: `/v1/messages/${msg.id}`, headers: auth });
   assert.equal(get.statusCode, 200);
   assert.equal(get.json().id, msg.id);
@@ -137,6 +146,7 @@ test('GET /metrics exposes Prometheus text', async () => {
   assert.match(String(res.headers['content-type']), /text\/plain/);
   assert.match(res.body, /notify_messages\{status="queued"\} \d+/);
   assert.match(res.body, /notify_oldest_queued_age_seconds/);
+  assert.match(res.body, /notify_worker_up \d/);
 });
 
 test('rate limit is enforced per API key', async () => {

@@ -3,7 +3,7 @@ import { createServer } from 'node:http';
 import { after, before, test } from 'node:test';
 import { WebhookSigner } from '../src/channels/webhook.js';
 import { Worker } from '../src/worker.js';
-import { emailBody, silentLog, testConfig, testEmailChannel, testQueue, testWebhookChannel, WEBHOOK_SECRET } from './helpers.js';
+import { emailBody, silentLog, testConfig, testEmailChannel, testPresence, testQueue, testWebhookChannel, WEBHOOK_SECRET } from './helpers.js';
 
 /** Local webhook receiver: behaviour chosen by path. Records every request. */
 /** @type {{ url: string|undefined, headers: import('node:http').IncomingHttpHeaders, body: string }[]} */
@@ -35,15 +35,16 @@ after(() => server.close());
  * @param {{ allowPrivate?: boolean, emailFail?: unknown }} [opts]
  */
 function setup(overrides = {}, { allowPrivate = true, emailFail } = {}) {
-  const config = testConfig({ WEBHOOK_TIMEOUT_MS: '1000', LOCK_TTL_MS: '5000', ...overrides });
+  const config = testConfig({ WEBHOOK_TIMEOUT_MS: '1000', LOCK_TTL_MS: '5000', HEARTBEAT_MS: '1000', ...overrides });
   const queue = testQueue(config);
+  const presence = testPresence();
   const { channel: email, sent } = testEmailChannel(config, { fail: emailFail });
   const webhook = testWebhookChannel(config, { allowPrivate });
   const worker = new Worker({
-    queue, channels: [email, webhook], log: silentLog,
-    options: { concurrency: config.workerConcurrency, pollMs: config.workerPollMs, retentionDays: config.retentionDays },
+    queue, presence, channels: [email, webhook], log: silentLog,
+    options: { concurrency: config.workerConcurrency, pollMs: config.workerPollMs, retentionDays: config.retentionDays, heartbeatMs: config.heartbeatMs },
   });
-  return { config, queue, worker, sent };
+  return { config, queue, presence, worker, sent };
 }
 
 /** @param {string} path */
@@ -149,7 +150,9 @@ test('webhook to a private or disallowed host fails permanently without connecti
 });
 
 test('start/stop loop drains the queue and recovers stale processing rows', async () => {
-  const { queue, worker } = setup();
+  // Stage 6: recovering a stale lock now costs an attempt and schedules the normal backoff delay
+  // (previously a free, immediate re-queue) — a tiny BACKOFF_BASE_MS keeps this test fast.
+  const { queue, worker } = setup({ BACKOFF_BASE_MS: '100' });
   const stale = queue.enqueue({ apiKeyId: 'a', channel: 'webhook', payload: webhookPayload('/ok') }, 0).row;
   queue.claim(1, 0); // simulate a crash mid-delivery long ago
   assert.equal(queue.get(stale.id, 'a')?.status, 'processing');
@@ -158,4 +161,40 @@ test('start/stop loop drains the queue and recovers stale processing rows', asyn
   while (queue.get(stale.id, 'a')?.status !== 'sent' && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
   await worker.stop();
   assert.equal(queue.get(stale.id, 'a')?.status, 'sent');
+});
+
+test('Worker: a rolling pool refills a freed slot instead of waiting for the whole batch (Stage 6 fix)', async (t) => {
+  // Self-contained receiver: /slow blocks for the whole test, /fast answers immediately. With the
+  // pre-Stage-6 Promise.all(batch) loop and concurrency=2, claiming [slow, fast1] together would
+  // keep fast1's slot occupied (awaiting the whole batch) until /slow finally answers, so fast2
+  // could not even be claimed in the meantime. The rolling pool claims a replacement as soon as
+  // fast1's own promise resolves, regardless of slow's still being in flight.
+  let releaseSlow = /** @type {() => void} */ (() => {});
+  const rx = createServer((req, res) => {
+    if (req.url === '/slow') { releaseSlow = () => res.writeHead(200).end('{}'); return; }
+    res.writeHead(200).end('{}');
+  });
+  await new Promise((r) => rx.listen(0, '127.0.0.1', () => r(undefined)));
+  const addr = /** @type {import('node:net').AddressInfo} */ (rx.address());
+  const rxUrl = `http://127.0.0.1:${addr.port}`;
+  t.after(() => rx.close());
+
+  const { queue, worker } = setup({ WORKER_CONCURRENCY: '2' });
+  // Distinct next_attempt_at (via distinct enqueue `now`s) makes claim order deterministic:
+  // slow and fast1 are due first and claimed together, fast2 only becomes claimable once a slot frees.
+  const slow = queue.enqueue({ apiKeyId: 'a', channel: 'webhook', payload: { channel: 'webhook', url: `${rxUrl}/slow`, event: 'e', data: {} } }, 0).row;
+  const fast1 = queue.enqueue({ apiKeyId: 'a', channel: 'webhook', payload: { channel: 'webhook', url: `${rxUrl}/fast`, event: 'e', data: {} } }, 1).row;
+  const fast2 = queue.enqueue({ apiKeyId: 'a', channel: 'webhook', payload: { channel: 'webhook', url: `${rxUrl}/fast`, event: 'e', data: {} } }, 2).row;
+
+  worker.start();
+  const deadline = Date.now() + 2000;
+  while (queue.get(fast2.id, 'a')?.status !== 'sent' && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+  assert.equal(queue.get(fast2.id, 'a')?.status, 'sent', 'fast2 was claimed and delivered while slow was still outstanding');
+  assert.equal(queue.get(fast1.id, 'a')?.status, 'sent');
+  assert.equal(queue.get(slow.id, 'a')?.status, 'processing', 'slow has still not been answered');
+  releaseSlow();
+  const slowDeadline = Date.now() + 2000;
+  while (queue.get(slow.id, 'a')?.status !== 'sent' && Date.now() < slowDeadline) await new Promise((r) => setTimeout(r, 10));
+  await worker.stop();
+  assert.equal(queue.get(slow.id, 'a')?.status, 'sent');
 });

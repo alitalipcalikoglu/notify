@@ -35,6 +35,18 @@ export class InvalidCursorError extends Error {
   }
 }
 
+/**
+ * A replay of an idempotency key whose payload or channel does not match the original message.
+ * The key is meant to identify one logical send, not to be reused for something else.
+ */
+export class IdempotencyConflictError extends Error {
+  /** @param {string} idempotencyKey */
+  constructor(idempotencyKey) {
+    super(`idempotency key "${idempotencyKey}" was already used with a different channel or payload`);
+    this.name = 'IdempotencyConflictError';
+  }
+}
+
 /** Opaque pagination cursor over (created_at, id). */
 class Cursor {
   /** @param {MessageRow} row */
@@ -55,10 +67,20 @@ class Cursor {
 
 /**
  * Persistent delivery queue on top of SQLite. All methods are synchronous.
+ *
+ * Lease ownership (Stage 6): {@link claim} hands the whole claimed batch one fresh random
+ * `owner_token` (the fencing token) — one per claim CALL, not per row, since every write that ends
+ * an attempt ({@link markSent}, {@link markFailure}) is already scoped to one row by `id` in its
+ * `WHERE` clause; adding `AND owner_token = ?` to that same clause is what makes the write
+ * fencing-safe, and a batch-shared token satisfies that exactly as well as a per-row one would
+ * (two different rows never compare tokens against each other). A worker that claimed a batch,
+ * then hung long enough for {@link reclaimExpired} to reclaim one of its rows, can no longer
+ * overwrite that row when it eventually returns — its `owner_token` no longer matches, and by then
+ * `status` isn't `'processing'` under it either.
  */
 export class Queue {
   static COLUMNS = `id, api_key_id, idempotency_key, channel, payload, status, attempts, max_attempts,
-    next_attempt_at, locked_until, last_error, provider_id, created_at, updated_at, sent_at`;
+    next_attempt_at, locked_until, last_error, provider_id, created_at, updated_at, sent_at, owner_token`;
 
   /**
    * @param {Database} db
@@ -79,24 +101,24 @@ export class Queue {
       byIdempotency: db.prepare(`SELECT ${C} FROM messages WHERE api_key_id = ? AND idempotency_key = ?`),
       byId: db.prepare(`SELECT ${C} FROM messages WHERE id = ? AND api_key_id = ?`),
       claim: db.prepare(`
-        UPDATE messages SET status = 'processing', locked_until = ?, updated_at = ?
+        UPDATE messages SET status = 'processing', locked_until = ?, owner_token = ?, updated_at = ?
         WHERE id IN (
           SELECT id FROM messages WHERE status = 'queued' AND next_attempt_at <= ?
           ORDER BY next_attempt_at, created_at LIMIT ?
         )
         RETURNING ${C}`),
       sent: db.prepare(`
-        UPDATE messages SET status = 'sent', provider_id = ?, locked_until = NULL, last_error = NULL,
+        UPDATE messages SET status = 'sent', provider_id = ?, locked_until = NULL, owner_token = NULL, last_error = NULL,
           sent_at = ?, updated_at = ?
-        WHERE id = ? AND status = 'processing'`),
+        WHERE id = ? AND status = 'processing' AND owner_token = ?`),
       failure: db.prepare(`
-        UPDATE messages SET attempts = attempts + 1, status = ?, next_attempt_at = ?, locked_until = NULL,
+        UPDATE messages SET attempts = attempts + 1, status = ?, next_attempt_at = ?, locked_until = NULL, owner_token = NULL,
           last_error = ?, updated_at = ?
-        WHERE id = ? AND status = 'processing'
+        WHERE id = ? AND status = 'processing' AND owner_token = ?
         RETURNING ${C}`),
-      reap: db.prepare(`
-        UPDATE messages SET status = 'queued', locked_until = NULL, updated_at = ?
-        WHERE status = 'processing' AND locked_until < ?`),
+      heartbeat: db.prepare(`UPDATE messages SET locked_until = ? WHERE id = ? AND owner_token = ? AND status = 'processing'`),
+      expiredLocks: db.prepare(`SELECT ${C} FROM messages WHERE status = 'processing' AND (locked_until IS NULL OR locked_until < ?)`),
+      processingCount: db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE status = 'processing'`),
       purge: db.prepare(`DELETE FROM messages WHERE status IN ('sent', 'failed') AND updated_at < ?`),
       retry: db.prepare(`
         UPDATE messages SET status = 'queued', attempts = 0, next_attempt_at = ?, last_error = NULL, updated_at = ?
@@ -108,8 +130,11 @@ export class Queue {
   }
 
   /**
-   * Insert a new message. If `idempotencyKey` was already used by this API key, the existing
-   * row is returned and `created` is false.
+   * Insert a new message. If `idempotencyKey` was already used by this API key with the SAME
+   * channel and payload, the existing row is returned and `created` is false. Reused with a
+   * DIFFERENT channel or payload, it's a conflict — the key identifies one logical send, not a
+   * slot to overwrite — and throws {@link IdempotencyConflictError} rather than silently
+   * succeeding with the original (stale) content.
    * @param {{ apiKeyId: string, idempotencyKey?: string|null, channel: 'email'|'webhook', payload: object }} input
    * @param {number} [now]
    * @returns {{ row: MessageRow, created: boolean }}
@@ -117,62 +142,95 @@ export class Queue {
   enqueue(input, now = Date.now()) {
     const id = randomUUID();
     const key = input.idempotencyKey ?? null;
+    const payloadJson = JSON.stringify(input.payload);
     const result = this.stmt.insert.run(
-      id, input.apiKeyId, key, input.channel, JSON.stringify(input.payload),
-      this.maxAttempts, now, now, now,
+      id, input.apiKeyId, key, input.channel, payloadJson, this.maxAttempts, now, now, now,
     );
     if (result.changes === 1) {
       return { row: /** @type {MessageRow} */ (this.stmt.byId.get(id, input.apiKeyId)), created: true };
     }
     const existing = /** @type {MessageRow|undefined} */ (this.stmt.byIdempotency.get(input.apiKeyId, key));
     if (!existing) throw new Error('enqueue: insert ignored but no existing row found');
+    if (existing.channel !== input.channel || existing.payload !== payloadJson) throw new IdempotencyConflictError(/** @type {string} */ (key));
     return { row: existing, created: false };
   }
 
   /**
-   * Atomically move up to `limit` due messages to `processing` and return them.
+   * Atomically move up to `limit` due messages to `processing`, all under one fresh `owner_token`,
+   * and return them.
    * @param {number} limit
    * @param {number} [now]
    * @returns {MessageRow[]}
    */
   claim(limit, now = Date.now()) {
     if (limit <= 0) return [];
-    return /** @type {MessageRow[]} */ (this.stmt.claim.all(now + this.lockTtlMs, now, now, limit));
+    return /** @type {MessageRow[]} */ (this.stmt.claim.all(now + this.lockTtlMs, randomUUID(), now, now, limit));
   }
 
   /**
    * @param {string} id
+   * @param {string} ownerToken
    * @param {string|null} providerId
    * @param {number} [now]
+   * @returns {boolean} Whether `ownerToken` still held the lease (`false` = discard the result, see {@link reclaimExpired}).
    */
-  markSent(id, providerId, now = Date.now()) {
-    this.stmt.sent.run(providerId, now, now, id);
+  markSent(id, ownerToken, providerId, now = Date.now()) {
+    return Number(this.stmt.sent.run(providerId, now, now, id, ownerToken).changes) > 0;
   }
 
   /**
-   * Record a failed attempt. Re-queues with backoff unless attempts are exhausted or `final` is set.
+   * Record a failed attempt, but only while `ownerToken` still holds the lease. Re-queues with
+   * backoff unless attempts are exhausted or `final` is set.
    * @param {MessageRow} row  The row as returned by {@link claim}.
+   * @param {string} ownerToken
    * @param {string} error
    * @param {{ final?: boolean, now?: number }} [opts]
-   * @returns {MessageRow|undefined}
+   * @returns {MessageRow|undefined} Undefined both when the schedule allows no more attempts
+   *   without a written row (never happens: see status logic) and, meaningfully, when the lease
+   *   had already moved on — the caller must not treat that as a normal completion.
    */
-  markFailure(row, error, { final = false, now = Date.now() } = {}) {
+  markFailure(row, ownerToken, error, { final = false, now = Date.now() } = {}) {
     const attempts = row.attempts + 1;
     const exhausted = final || attempts >= row.max_attempts;
     /** @type {MessageStatus} */
     const status = exhausted ? 'failed' : 'queued';
     const nextAt = exhausted ? row.next_attempt_at : now + this.backoff.delay(attempts);
-    const rows = /** @type {MessageRow[]} */ (this.stmt.failure.all(status, nextAt, error.slice(0, 2000), now, row.id));
+    const rows = /** @type {MessageRow[]} */ (this.stmt.failure.all(status, nextAt, error.slice(0, 2000), now, row.id, ownerToken));
     return rows[0];
   }
 
   /**
-   * Return messages whose lock expired (worker crashed mid-send) to the queue.
-   * @param {number} [now]
-   * @returns {number} Rows affected.
+   * Renew the lock while a send is still in flight. Returns whether `ownerToken` still holds it —
+   * `false` means another process already reclaimed this message.
+   * @param {string} id @param {string} ownerToken @param {number} now @param {number} [lockTtlMs]
    */
-  reapStale(now = Date.now()) {
-    return Number(this.stmt.reap.run(now, now).changes);
+  heartbeat(id, ownerToken, now, lockTtlMs = this.lockTtlMs) {
+    return Number(this.stmt.heartbeat.run(now + lockTtlMs, id, ownerToken).changes) > 0;
+  }
+
+  /**
+   * Atomically find every message whose lock has expired (or predates leases) and, in the SAME
+   * transaction, record each one as a failed attempt labeled `error` (costs an attempt, follows
+   * the normal backoff/exhaustion rule — unlike the pre-Stage-6 reap, which reset the row for
+   * free). Running the read and every write inside one transaction is what makes this race-free
+   * against a concurrent {@link heartbeat}: it either commits entirely before this call (the row
+   * is no longer expired, so it's simply not selected) or is attempted entirely after (its own
+   * guarded `UPDATE` then matches zero rows, because this transaction already moved the row off
+   * `'processing'`).
+   * @param {number} [now]
+   * @param {string} [error]
+   * @returns {MessageRow[]}
+   */
+  reclaimExpired(now = Date.now(), error = 'lease expired') {
+    return this.db.transaction(() => {
+      const stale = /** @type {MessageRow[]} */ (this.stmt.expiredLocks.all(now));
+      return stale.map((row) => /** @type {MessageRow} */ (this.markFailure(row, /** @type {string} */ (row.owner_token), error, { now })));
+    });
+  }
+
+  /** Live in-flight count, for an API-only process that has no in-process Worker to ask. */
+  processingCount() {
+    return Number(/** @type {{ n: number }} */ (this.stmt.processingCount.get()).n);
   }
 
   /**

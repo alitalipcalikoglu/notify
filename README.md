@@ -111,12 +111,12 @@ The receiver gets `POST` with body `{ "id", "event", "timestamp", "data" }` and 
 
 `queued` → `processing` → `sent` | `failed`.
 
-- Delivery runs in-process. Up to `WORKER_CONCURRENCY` messages are claimed atomically per pass.
+- A rolling pool keeps up to `WORKER_CONCURRENCY` messages in flight at any time — a slot freed by one finishing send is refilled immediately, not held idle until a whole claimed batch finishes (Stage 6 fix: was previously `Promise.all` over a fixed batch, so one slow send idled the rest of the pool).
 - Failures retry with exponential backoff and jitter (`BACKOFF_BASE_MS` doubling up to `BACKOFF_CAP_MS`) until `MAX_ATTEMPTS`.
 - Permanent failures stop immediately: SMTP 5xx replies, webhook 3xx/4xx other than 408/425/429, and any blocked target.
-- A message left in `processing` longer than `LOCK_TTL_MS` (crash mid-send) is returned to the queue.
+- A message claimed longer than `LOCK_TTL_MS` without a heartbeat (crash, or an event-loop stall long enough to miss every renewal) is reclaimed as a failed attempt — costs an attempt and follows the normal backoff/exhaustion schedule, same as any other failure (Stage 6: previously a free reset with no attempt cost). A heartbeat renews the lock every `HEARTBEAT_MS` while a send is genuinely still in flight, so an ordinary slow send never loses its lock on its own.
 - `sent` and `failed` rows are deleted after `RETENTION_DAYS`.
-- `idempotencyKey` is unique per API key; a repeat returns the original message instead of sending twice.
+- `idempotencyKey` is unique per API key; a repeat with the SAME channel and payload returns the original message instead of sending twice. A repeat with a DIFFERENT channel or payload is a `409 IDEMPOTENCY_CONFLICT` (Stage 6: previously silently returned the stale original as if it had succeeded) — the key identifies one logical send, not a slot to overwrite.
 
 ## Code layout
 
@@ -139,7 +139,7 @@ Class-based; dependencies are injected through constructors, `src/application.js
 
 ## Security notes
 
-- API secrets are compared in constant time; every configured key is checked so timing does not reveal which one matched.
+- API secrets are compared in constant time; every configured key is checked so timing does not reveal which one matched. `WebhookSigner.verify()` (the reference signature-verification helper receivers can use) compares the HMAC digest with `timingSafeEqual`, not a short-circuiting `Buffer.equals` (Stage 6 fix).
 - Rate limit per API key (`RATE_LIMIT_MAX` per minute).
 - Webhook targets are resolved before connecting and rejected when any address is loopback, private, link-local, multicast, or another special range (IPv4 and IPv6 including mapped, NAT64, 6to4 and Teredo forms). The vetted address is pinned for the connection so DNS rebinding cannot redirect it. `https` only unless `WEBHOOK_ALLOW_HTTP=true`. URLs with credentials are rejected.
 - Template data is escaped on output; button URLs must be `http(s)`; subjects are collapsed to one line to prevent header injection.
@@ -151,19 +151,41 @@ Class-based; dependencies are injected through constructors, `src/application.js
 
 - SMS and push channels: these need a provider account; add a channel module next to `src/channels/` when one is chosen.
 - Attachments: the service sends templated messages only. Send a link instead.
-- Multiple worker processes on one SQLite file: claims are atomic, so it works, but the intended deployment is one instance per database. Move to Postgres if you need horizontal scaling.
+- True multi-host distribution: every process (API or worker, however many) must reach the same `DB_PATH` file on one host — there is no network-shared queue. Move to a server database if you need horizontal scaling across hosts.
 
 ## Audit events
 
 With `AUDIT_URL` and `AUDIT_API_KEY` set, every completed write request is forwarded to the audit service as one event (`success`, or `denied` on 403) with the calling key as actor, the affected entity as target, client IP, user agent and request id. Events are buffered and sent in batches; the audit service being down never fails a request. Actions: see [examples/audit-events.md](examples/audit-events.md).
 
-## Scaling model
+## API/worker runtime split
 
-One process owns one SQLite file (`DB_PATH`); `ecosystem.config.cjs` hardcodes `instances: 1` for
-that reason. Message claiming is a single atomic SQL statement, so a second instance against the
-same file would not double-deliver, but nothing coordinates migrations or maintenance across
-instances — it is not a supported scale-out path. Horizontal scaling means moving to a server
-database. See [docs/READINESS.md](docs/READINESS.md) for the full contract.
+`src/index.js` (default) runs both the HTTP API and the worker loop in one process — nothing about
+existing single-process deployments changes. Two more entry points exist for a split deployment:
+`src/api-main.js` (HTTP only, never claims a message) and `src/worker-main.js` (worker only, no
+HTTP listener at all — PM2's own process state is the liveness signal). All three share the same
+`Config`, the same database, the same migrations. `npm run api` / `npm run worker` run them
+directly; `ecosystem.config.cjs` has the split apps ready to uncomment. `/ready` and `/metrics` were
+already DB-backed before this split (never read an in-process `Worker` field); a new
+`worker_heartbeat` table adds the one signal that wasn't already there — is a worker alive at all.
+
+## Lease ownership and scaling model
+
+Every claimed batch of messages gets a fencing token (`owner_token`) and a lease (`locked_until`,
+the same column this service always had, now fencing-checked on write too). A worker renews the
+lease every `HEARTBEAT_MS` while a send is in flight (`LOCK_TTL_MS`, default 120s; `HEARTBEAT_MS`,
+default 10s — must be well under `LOCK_TTL_MS`), so a send taking longer than `LOCK_TTL_MS` never
+loses its lock on its own. If a worker crashes or hangs long enough that its lock genuinely
+expires, another worker (or the same one, restarted) reclaims the message as a failed attempt —
+following the normal backoff/exhaustion schedule, which now costs an attempt (before Stage 6, a
+reclaimed lock was reset for free, with no attempt cost) — and the fencing token means the original
+worker cannot overwrite that outcome if it later finishes the send it no longer owns.
+
+This makes **multiple worker processes against the same `DB_PATH` a supported topology**: the
+commented-out split `notify-worker` app in `ecosystem.config.cjs` can run with `instances` > 1.
+Claiming is atomic across processes (one `UPDATE ... RETURNING` statement), proven with real
+cross-connection concurrency in `test/lease-concurrency.test.js`. Still one host, one SQLite file —
+not a distributed queue; horizontal scaling across hosts still means moving to a server database.
+See [docs/READINESS.md](docs/READINESS.md) for the full contract.
 
 ## Observability
 

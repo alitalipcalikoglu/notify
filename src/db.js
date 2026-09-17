@@ -27,5 +27,22 @@ export class Database extends CoreDatabase {
     CREATE INDEX messages_list ON messages (api_key_id, created_at DESC, id DESC);
     CREATE INDEX messages_retention ON messages (status, updated_at);
     `,
+    `
+    -- Stage 6: lease ownership. owner_token is the fencing token — a fresh random value per claim
+    -- batch, never reused, so a write guarded by "WHERE owner_token = ?" can only ever succeed for
+    -- whoever currently holds the lease. NULL for every pre-migration 'processing' row (no legacy
+    -- lease to compare against, so the reclaim query treats a NULL token as already reclaimable).
+    ALTER TABLE messages ADD COLUMN owner_token TEXT;
+
+    -- One row per live worker process (API-only processes have none of their own). Written on a
+    -- timer by any process running a Worker loop; read by an API-only process's /ready and
+    -- /metrics in place of the in-process Worker object it doesn't have (notify's readiness/stats
+    -- were already DB-backed before this stage; this table adds the one signal that wasn't: is a
+    -- worker alive at all).
+    CREATE TABLE worker_heartbeat (
+      instance TEXT PRIMARY KEY,
+      seen_at  INTEGER NOT NULL
+    );
+    `,
   ];
 }

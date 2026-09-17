@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { Backoff, InvalidCursorError } from '../src/queue.js';
+import { Backoff, IdempotencyConflictError, InvalidCursorError } from '../src/queue.js';
 
 /** @type {(attempt: number, base: number, cap: number, random: () => number) => number} */
 const backoffMs = (attempt, base, cap, random) => new Backoff(base, cap, random).delay(attempt);
@@ -28,9 +28,10 @@ test('enqueue + claim + markSent lifecycle', () => {
   assert.equal(claimed.length, 1);
   assert.equal(claimed[0].status, 'processing');
   assert.equal(claimed[0].locked_until, 1000 + config.lockTtlMs);
+  assert.ok(claimed[0].owner_token, 'claim hands out a fencing token');
   assert.deepEqual(q.claim(5, 1000), [], 'already claimed');
 
-  q.markSent(row.id, 'msg-1', 1100);
+  assert.equal(q.markSent(row.id, claimed[0].owner_token, 'msg-1', 1100), true);
   const after = q.get(row.id, 'a');
   assert.equal(after?.status, 'sent');
   assert.equal(after?.provider_id, 'msg-1');
@@ -52,29 +53,41 @@ test('idempotency key returns the existing row per api key', () => {
   assert.notEqual(noKey1.row.id, noKey2.row.id);
 });
 
+test('enqueue: reusing an idempotency key with a different channel or payload is a conflict, not a silent success', () => {
+  const q = testQueue(config);
+  q.enqueue({ apiKeyId: 'a', idempotencyKey: 'k1', channel: 'webhook', payload }, 0);
+  assert.throws(() => q.enqueue({ apiKeyId: 'a', idempotencyKey: 'k1', channel: 'webhook', payload: { ...payload, url: 'https://other.example' } }, 0), IdempotencyConflictError);
+  assert.throws(() => q.enqueue({ apiKeyId: 'a', idempotencyKey: 'k1', channel: 'email', payload: { channel: 'email', template: 'generic', to: ['x@example.com'], data: {} } }, 0), IdempotencyConflictError);
+  // The exact same channel + payload replays cleanly (already covered above); a byte-identical
+  // re-send of an otherwise-equal object also replays cleanly.
+  const replay = q.enqueue({ apiKeyId: 'a', idempotencyKey: 'k1', channel: 'webhook', payload: { ...payload } }, 0);
+  assert.equal(replay.created, false);
+});
+
 test('markFailure re-queues with backoff, fails after max attempts or when final', () => {
   const q = testQueue(config);
   const { row } = q.enqueue({ apiKeyId: 'a', channel: 'webhook', payload }, 0);
   let [c] = q.claim(1, 0);
-  let u = q.markFailure(c, 'boom', { now: 0 });
+  let u = q.markFailure(c, /** @type {string} */ (c.owner_token), 'boom', { now: 0 });
   assert.equal(u?.status, 'queued');
   assert.equal(u?.attempts, 1);
   assert.ok(u && u.next_attempt_at >= 50 && u.next_attempt_at <= 100, `backoff ${u?.next_attempt_at}`);
   assert.equal(u?.last_error, 'boom');
+  assert.equal(q.markFailure(c, /** @type {string} */ (c.owner_token), 'stale', { now: 0 }), undefined, 'the same claim cannot fail twice: owner_token/status guard rejects the second write');
 
   [c] = q.claim(1, 1000);
-  u = q.markFailure(c, 'boom2', { now: 1000 });
+  u = q.markFailure(c, /** @type {string} */ (c.owner_token), 'boom2', { now: 1000 });
   assert.equal(u?.status, 'queued');
   assert.equal(u?.attempts, 2);
 
   [c] = q.claim(1, 5000);
-  u = q.markFailure(c, 'boom3', { now: 5000 });
+  u = q.markFailure(c, /** @type {string} */ (c.owner_token), 'boom3', { now: 5000 });
   assert.equal(u?.status, 'failed', 'third failure exhausts max_attempts=3');
   assert.equal(q.claim(1, 999_999).length, 0);
 
   const { row: r2 } = q.enqueue({ apiKeyId: 'a', channel: 'webhook', payload }, 0);
   [c] = q.claim(1, 0);
-  u = q.markFailure(c, 'permanent', { final: true, now: 0 });
+  u = q.markFailure(c, /** @type {string} */ (c.owner_token), 'permanent', { final: true, now: 0 });
   assert.equal(u?.status, 'failed');
   assert.equal(u?.attempts, 1);
 
@@ -85,16 +98,23 @@ test('markFailure re-queues with backoff, fails after max attempts or when final
   assert.equal(q.retry(retried.id, 'a', 10), undefined, 'only failed rows can be retried');
 });
 
-test('reapStale recovers expired locks; purge removes old finished rows', () => {
+test('reclaimExpired settles expired locks as a failed attempt (Stage 6: costs an attempt, not a free reset); purge removes old finished rows', () => {
   const q = testQueue(config);
   const { row } = q.enqueue({ apiKeyId: 'a', channel: 'webhook', payload }, 0);
-  q.claim(1, 0);
-  assert.equal(q.reapStale(config.lockTtlMs - 1), 0);
-  assert.equal(q.reapStale(config.lockTtlMs + 1), 1);
+  const [claimed] = q.claim(1, 0);
+  assert.deepEqual(q.reclaimExpired(config.lockTtlMs - 1), [], 'lock not expired yet');
+  const reclaimed = q.reclaimExpired(config.lockTtlMs + 1);
+  assert.equal(reclaimed.length, 1);
+  assert.equal(reclaimed[0].status, 'queued', 'first failed attempt: back to queued with backoff, not exhausted');
+  assert.equal(reclaimed[0].attempts, 1, 'unlike the pre-Stage-6 free reap, this cost an attempt');
+  assert.equal(reclaimed[0].last_error, 'lease expired');
   assert.equal(q.get(row.id, 'a')?.status, 'queued');
+  // The original claim's owner_token no longer owns the row after reclaim — a late finish() from
+  // that same claim must not overwrite the reclaimed outcome.
+  assert.equal(q.markSent(row.id, /** @type {string} */ (claimed.owner_token), 'late', config.lockTtlMs + 2), false);
 
   const [c] = q.claim(1, 200_000);
-  q.markSent(c.id, null, 200_000);
+  q.markSent(c.id, /** @type {string} */ (c.owner_token), null, 200_000);
   assert.equal(q.purge(200_000), 0, 'not strictly older');
   assert.equal(q.purge(200_001), 1);
   assert.equal(q.get(row.id, 'a'), undefined);
@@ -106,7 +126,7 @@ test('list paginates newest first with an opaque cursor and filters by status', 
   for (let i = 0; i < 5; i++) ids.push(q.enqueue({ apiKeyId: 'a', channel: 'webhook', payload }, 1000 + i).row.id);
   q.enqueue({ apiKeyId: 'b', channel: 'webhook', payload }, 2000);
   const [c] = q.claim(1, 5000);
-  q.markSent(c.id, null, 5000);
+  q.markSent(c.id, /** @type {string} */ (c.owner_token), null, 5000);
 
   const page1 = q.list({ apiKeyId: 'a', limit: 2 });
   assert.equal(page1.items.length, 2);

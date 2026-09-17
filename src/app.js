@@ -5,7 +5,7 @@ import Fastify from 'fastify';
 import { AuditClient } from '@atc-web/service-core/audit';
 import { registerProbes } from '@atc-web/service-core/fastify';
 import { ApiKeyAuth } from './auth.js';
-import { InvalidCursorError } from './queue.js';
+import { IdempotencyConflictError, InvalidCursorError } from './queue.js';
 
 /** @typedef {import('./config.js').Config} Config */
 /** @typedef {import('./types.js').MessageRow} MessageRow */
@@ -143,26 +143,36 @@ class Schemas {
  */
 export class NotifyApi {
   static READY_CACHE_MS = 30_000;
+  /** A worker_heartbeat row older than this many worker heartbeat intervals is considered dead. */
+  static PRESENCE_STALE_FACTOR = 4;
 
   /**
    * @param {object} deps
    * @param {Config} deps.config
    * @param {Queue} deps.queue
+   * @param {import('./heartbeat-store.js').HeartbeatStore} deps.presence
    * @param {TemplateRegistry} deps.templates
    * @param {AnyChannel[]} deps.channels   Probed by `/ready`.
    * @param {import('./types.js').Logger} [deps.logger]
    * @param {import('@atc-web/service-core/audit').AuditClient} [deps.audit]
    */
-  constructor({ config, audit, queue, templates, channels, logger }) {
+  constructor({ config, audit, queue, presence, templates, channels, logger }) {
     this.config = config;
     this.audit = audit;
     this.queue = queue;
+    this.presence = presence;
     this.templates = templates;
     this.channels = channels;
     this.logger = logger;
     this.auth = new ApiKeyAuth(config.apiKeys);
     /** @type {Map<string, DataValidator>} */
     this.dataValidators = new Map();
+  }
+
+  /** `'running'`/`'stopped'`, from a recent `worker_heartbeat` row — this API never had an in-process Worker to ask directly, even in the combined role (see `#registerV1`'s worker-state module doc). @param {number} [now] */
+  workerStatus(now = Date.now()) {
+    const seenAt = this.presence.latest();
+    return seenAt !== null && now - seenAt < this.config.heartbeatMs * NotifyApi.PRESENCE_STALE_FACTOR ? 'running' : 'stopped';
   }
 
   /** @returns {Promise<import('fastify').FastifyInstance>} */
@@ -187,7 +197,7 @@ export class NotifyApi {
     registerProbes(app, async () => {
       this.queue.db.ping();
       for (const ch of this.channels) await ch.verify();
-    }, { cacheMs: NotifyApi.READY_CACHE_MS });
+    }, { cacheMs: NotifyApi.READY_CACHE_MS, extra: () => ({ worker: this.workerStatus() }) });
     await app.register((api) => this.#registerV1(api), { prefix: '/v1' });
     await app.register((ops) => this.#registerMetrics(ops));
     return app;
@@ -207,6 +217,9 @@ export class NotifyApi {
     }
     if (err instanceof InvalidCursorError) {
       return reply.code(400).send({ error: { code: 'INVALID_CURSOR', message: err.message } });
+    }
+    if (err instanceof IdempotencyConflictError) {
+      return reply.code(409).send({ error: { code: 'IDEMPOTENCY_CONFLICT', message: err.message } });
     }
     const status = err.statusCode && err.statusCode >= 400 && err.statusCode < 600 ? err.statusCode : 500;
     if (status >= 500) {
@@ -331,6 +344,9 @@ export class NotifyApi {
         '# HELP notify_oldest_queued_age_seconds Age of the oldest due-or-waiting queued message.',
         '# TYPE notify_oldest_queued_age_seconds gauge',
         `notify_oldest_queued_age_seconds ${(s.oldestQueuedAgeMs / 1000).toFixed(3)}`,
+        '# HELP notify_worker_up 1 if a worker process is currently alive (this process itself, or another one reporting through worker_heartbeat), else 0.',
+        '# TYPE notify_worker_up gauge',
+        `notify_worker_up ${this.workerStatus() === 'running' ? 1 : 0}`,
         '# HELP notify_process_uptime_seconds Process uptime.',
         '# TYPE notify_process_uptime_seconds gauge',
         `notify_process_uptime_seconds ${process.uptime().toFixed(0)}`,

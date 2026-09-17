@@ -34,6 +34,7 @@
  * @property {number} workerConcurrency
  * @property {number} workerPollMs
  * @property {number} lockTtlMs
+ * @property {number} heartbeatMs          How often an in-flight delivery's lock is renewed; must be < lockTtlMs.
  * @property {number} retentionDays
  * @property {number} rateLimitMax         Requests per minute per API key.
  */
@@ -60,6 +61,7 @@
  * @property {number} created_at
  * @property {number} updated_at
  * @property {number|null} sent_at
+ * @property {string|null} owner_token    The fencing token of whoever currently holds the lock; null when not `processing`.
  */
 
 /**
@@ -98,5 +100,19 @@
  */
 
 /** Minimal pino-compatible logger contract. @typedef {import('fastify').FastifyBaseLogger} Logger */
+
+/**
+ * The subset of a logger every non-HTTP consumer (`Worker`, `Lifecycle`) actually needs —
+ * satisfied both by a real Fastify/pino logger and by `ConsoleLogger` (used when there is no
+ * Fastify instance to log through, i.e. the worker-only role).
+ * @typedef {object} MinimalLogger
+ * @property {(o: object|string, m?: string) => void} info
+ * @property {(o: object|string, m?: string) => void} warn
+ * @property {(o: object|string, m?: string) => void} error
+ * @property {(o: object|string, m?: string) => void} fatal
+ * @property {(o: object|string, m?: string) => void} debug
+ * @property {(o: object|string, m?: string) => void} trace
+ * @property {(bindings: object) => MinimalLogger} child
+ */
 
 export {};

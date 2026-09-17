@@ -1,13 +1,25 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 
 /** @typedef {import('./queue.js').Queue} Queue */
+/** @typedef {import('./heartbeat-store.js').HeartbeatStore} HeartbeatStore */
 /** @typedef {import('./types.js').MessageRow} MessageRow */
-/** @typedef {import('./types.js').Logger} Logger */
+/** @typedef {import('./types.js').MinimalLogger} MinimalLogger */
 /** @typedef {import('./channels/channel.js').Channel<any>} AnyChannel */
 
 /**
- * Background delivery loop. Claims due messages in batches, hands each to its channel and
- * records the outcome. Also runs periodic maintenance: stale lock recovery and retention purge.
+ * Background delivery loop. Claims due messages into a rolling pool (up to `concurrency` in
+ * flight at any time — not a fixed batch awaited all at once, so one slow send no longer idles
+ * the rest of the pool until it finishes), hands each to its channel and records the outcome.
+ * Also reclaims messages whose lock expired (a previous process's crash, or this process's own
+ * hung send) and purges retained history.
+ *
+ * Lease ownership: `claim()` (`queue.js`) hands each claimed batch a fresh `owner_token`. While a
+ * send is in flight, `#startHeartbeat` renews `locked_until` every `heartbeatMs` — well inside
+ * `lockTtlMs`, so a normal send, however long, never loses its lock on its own. Every write that
+ * ends an attempt (`markSent`/`markFailure`) is guarded by that same `owner_token`, so a worker
+ * that hung long enough to be reclaimed by someone else can never overwrite the row when it
+ * eventually returns — its write simply matches zero rows and is discarded (logged, not thrown).
+ * See `scheduler`'s `worker.js` for the identical design, kept as an independent copy per service.
  */
 export class Worker {
   static MAINTENANCE_INTERVAL_MS = 60_000;
@@ -15,59 +27,92 @@ export class Worker {
   /**
    * @param {object} deps
    * @param {Queue} deps.queue
+   * @param {HeartbeatStore} deps.presence
    * @param {AnyChannel[]} deps.channels
-   * @param {Logger} deps.log
-   * @param {{ concurrency: number, pollMs: number, retentionDays: number }} deps.options
+   * @param {MinimalLogger} deps.log
+   * @param {{ concurrency: number, pollMs: number, retentionDays: number, heartbeatMs: number }} deps.options
+   * @param {() => number} [deps.now]
    */
-  constructor({ queue, channels, log, options }) {
+  constructor({ queue, presence, channels, log, options, now = Date.now }) {
     this.queue = queue;
+    this.presence = presence;
     this.channels = new Map(channels.map((c) => [c.name, c]));
     this.log = log;
     this.options = options;
+    this.now = now;
     this.running = false;
+    /** Guards claiming specifically, so shutdown can stop taking new work before it starts draining. Defaults true so `tick()` (no `start()` call) claims normally. */
+    this.claiming = true;
     /** @type {Promise<void>|null} */
     this.loop = null;
     this.abort = new AbortController();
+    /** @type {Set<Promise<void>>} */
+    this.inFlight = new Set();
     this.lastMaintenance = 0;
   }
 
   start() {
     if (this.running) return;
     this.running = true;
+    this.claiming = true;
     this.abort = new AbortController();
-    // Recover anything left in `processing` by a previous crash before the first claim.
-    const reaped = this.queue.reapStale();
-    if (reaped) this.log.warn({ reaped }, 'recovered messages left processing by a previous run');
-    this.lastMaintenance = Date.now();
+    this.recover();
+    this.lastMaintenance = this.now();
     this.loop = this.#run();
-    this.log.info({ concurrency: this.options.concurrency, pollMs: this.options.pollMs }, 'worker started');
+    this.log.info({ concurrency: this.options.concurrency, pollMs: this.options.pollMs, heartbeatMs: this.options.heartbeatMs }, 'worker started');
   }
 
-  /** Stop claiming and wait for in-flight deliveries to finish. */
+  /** Stop claiming new work; in-flight sends keep running until {@link stop} drains them. */
+  stopClaiming() {
+    this.claiming = false;
+  }
+
+  /** Stop claiming (if not already) and wait for in-flight sends to finish. */
   async stop() {
     if (!this.running) return;
     this.running = false;
+    this.claiming = false;
     this.abort.abort();
     await this.loop;
+    await Promise.allSettled(this.inFlight);
     this.loop = null;
     this.log.info('worker stopped');
   }
 
-  /** Run exactly one maintenance + claim-and-deliver pass. Used by tests. */
+  /**
+   * Messages left `processing` by a crash count as a failed attempt and follow the backoff
+   * schedule. Called once at startup — every `processing` row at that point is necessarily from a
+   * previous life of this process — and again, differently labeled, from the in-loop sweep.
+   */
+  recover() {
+    const recovered = this.queue.reclaimExpired(this.now(), 'interrupted by restart');
+    if (recovered.length) this.log.warn({ n: recovered.length }, 'recovered messages interrupted by a previous process');
+  }
+
+  /** Run exactly one maintenance + claim-and-deliver pass, awaiting everything claimed. Used by tests. */
   async tick() {
-    this.#maintenance();
-    await Promise.all(this.queue.claim(this.options.concurrency).map((row) => this.#deliver(row)));
+    this.#pass(this.now());
+    await Promise.allSettled([...this.inFlight]);
+  }
+
+  /** @param {number} now */
+  #pass(now) {
+    this.presence.beat(now);
+    this.#reclaimStale();
+    this.#maintenance(now);
+    if (!this.claiming) return;
+    const free = this.options.concurrency - this.inFlight.size;
+    if (free <= 0) return;
+    for (const row of this.queue.claim(free, now)) {
+      const p = this.#deliver(row).finally(() => this.inFlight.delete(p));
+      this.inFlight.add(p);
+    }
   }
 
   async #run() {
     while (this.running) {
       try {
-        this.#maintenance();
-        const batch = this.queue.claim(this.options.concurrency);
-        if (batch.length) {
-          await Promise.all(batch.map((row) => this.#deliver(row)));
-          if (batch.length === this.options.concurrency) continue; // more may be waiting
-        }
+        this.#pass(this.now());
       } catch (err) {
         this.log.error({ err }, 'worker iteration failed');
       }
@@ -84,30 +129,45 @@ export class Worker {
    * @param {MessageRow} row
    */
   async #deliver(row) {
-    const started = Date.now();
+    const started = this.now();
+    const ownerToken = /** @type {string} */ (row.owner_token);
     const meta = { messageId: row.id, channel: row.channel, attempt: row.attempts + 1 };
+    const heartbeat = setInterval(() => {
+      const ok = this.queue.heartbeat(row.id, ownerToken, this.now());
+      if (!ok) this.log.warn(meta, 'heartbeat found the lock already reassigned; ownership lost mid-send');
+    }, this.options.heartbeatMs).unref();
     const channel = this.channels.get(row.channel);
     try {
       if (!channel) throw Object.assign(new Error(`no channel registered for "${row.channel}"`), { retryable: false });
       const providerId = await channel.deliver(row.id, JSON.parse(row.payload));
-      this.queue.markSent(row.id, providerId);
-      this.log.info({ ...meta, providerId, durationMs: Date.now() - started }, 'delivered');
+      const ok = this.queue.markSent(row.id, ownerToken, providerId, this.now());
+      if (!ok) { this.log.warn(meta, 'lock lost before this delivery could be recorded; result discarded, another worker already reclaimed it'); return; }
+      this.log.info({ ...meta, providerId, durationMs: this.now() - started }, 'delivered');
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const retryable = channel ? channel.isRetryable(err) : false;
-      const updated = this.queue.markFailure(row, message, { final: !retryable });
-      const level = updated?.status === 'failed' ? 'error' : 'warn';
-      this.log[level]({ ...meta, err, status: updated?.status, nextAttemptAt: updated?.next_attempt_at }, 'delivery failed');
+      const updated = this.queue.markFailure(row, ownerToken, message, { final: !retryable, now: this.now() });
+      if (!updated) { this.log.warn(meta, 'lock lost before this failure could be recorded; result discarded, another worker already reclaimed it'); return; }
+      const level = updated.status === 'failed' ? 'error' : 'warn';
+      this.log[level]({ ...meta, err, status: updated.status, nextAttemptAt: updated.next_attempt_at }, 'delivery failed');
+    } finally {
+      clearInterval(heartbeat);
     }
   }
 
-  #maintenance() {
-    const now = Date.now();
+  /** In-loop counterpart to {@link recover}: catches a message whose lock expired without a heartbeat, without waiting for a restart. */
+  #reclaimStale() {
+    const recovered = this.queue.reclaimExpired(this.now(), 'lease expired');
+    if (recovered.length) this.log.warn({ n: recovered.length }, 'reclaimed messages whose lock expired without a heartbeat');
+  }
+
+  /** @param {number} now */
+  #maintenance(now) {
     if (now - this.lastMaintenance < Worker.MAINTENANCE_INTERVAL_MS) return;
     this.lastMaintenance = now;
-    const reaped = this.queue.reapStale(now);
-    if (reaped) this.log.warn({ reaped }, 'returned stale processing messages to queue');
     const purged = this.queue.purge(now - this.options.retentionDays * 86_400_000);
     if (purged) this.log.info({ purged }, 'purged finished messages past retention');
+    const staleHeartbeats = this.presence.purgeStale(now, Worker.MAINTENANCE_INTERVAL_MS * 5);
+    if (staleHeartbeats) this.log.debug({ staleHeartbeats }, 'purged stale worker_heartbeat rows');
   }
 }

@@ -35,6 +35,7 @@ export class Config {
     this.workerConcurrency = values.workerConcurrency;
     this.workerPollMs = values.workerPollMs;
     this.lockTtlMs = values.lockTtlMs;
+    this.heartbeatMs = values.heartbeatMs;
     this.retentionDays = values.retentionDays;
     this.rateLimitMax = values.rateLimitMax;
     Object.freeze(this);
@@ -66,7 +67,16 @@ export class Config {
 
     const backoffBaseMs = r.integer('BACKOFF_BASE_MS', 5_000, { min: 100 });
     const backoffCapMs = r.integer('BACKOFF_CAP_MS', 3_600_000, { min: backoffBaseMs });
-    const lockTtlMs = r.integer('LOCK_TTL_MS', 120_000, { min: 5_000 });
+    // Bounded (Stage 6): ecosystem.config.cjs's kill_timeout is a static value derived from this
+    // ceiling — see its comment for why an unbounded LOCK_TTL_MS would defeat that derivation.
+    const lockTtlMs = r.integer('LOCK_TTL_MS', 120_000, { min: 5_000, max: 600_000 });
+    // Stage 6: lease ownership. heartbeatMs must stay well under lockTtlMs — a single missed
+    // heartbeat (event loop stall, DB busy) must not itself be enough to lose the lock. The
+    // heartbeat is what actually protects a long SMTP/webhook send now (it renews the lock every
+    // heartbeatMs regardless of how long the call takes), which is why WEBHOOK_TIMEOUT_MS below no
+    // longer needs to be capped relative to lockTtlMs — see README's "Clock model".
+    const heartbeatMs = r.integer('HEARTBEAT_MS', 10_000, { min: 250 });
+    if (heartbeatMs >= lockTtlMs) throw new ConfigError('HEARTBEAT_MS must be less than LOCK_TTL_MS');
 
     return new Config({
       port: r.integer('PORT', 3001, { min: 1, max: 65535 }),
@@ -84,13 +94,14 @@ export class Config {
       webhookSigningSecret,
       webhookAllowedHosts: r.list('WEBHOOK_ALLOWED_HOSTS').map((h) => h.toLowerCase()),
       webhookAllowHttp: r.boolean('WEBHOOK_ALLOW_HTTP', false),
-      webhookTimeoutMs: r.integer('WEBHOOK_TIMEOUT_MS', 10_000, { min: 1_000, max: lockTtlMs / 2 }),
+      webhookTimeoutMs: r.integer('WEBHOOK_TIMEOUT_MS', 10_000, { min: 1_000, max: 120_000 }),
       maxAttempts: r.integer('MAX_ATTEMPTS', 8, { min: 1, max: 50 }),
       backoffBaseMs,
       backoffCapMs,
       workerConcurrency: r.integer('WORKER_CONCURRENCY', 5, { min: 1, max: 100 }),
       workerPollMs: r.integer('WORKER_POLL_MS', 500, { min: 50 }),
       lockTtlMs,
+      heartbeatMs,
       retentionDays: r.integer('RETENTION_DAYS', 30, { min: 1 }),
       rateLimitMax: r.integer('RATE_LIMIT_MAX', 600, { min: 1 }),
     });

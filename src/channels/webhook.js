@@ -1,4 +1,4 @@
-import { createHmac } from 'node:crypto';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
 import { Channel } from './channel.js';
@@ -57,7 +57,11 @@ export class WebhookSigner {
     if (Math.abs(now / 1000 - t) > toleranceSec) return false;
     const expected = this.#digest(body, t);
     const given = Buffer.from(m[2], 'hex');
-    return expected.length === given.length && expected.equals(given);
+    // Buffer.prototype.equals short-circuits on the first mismatching byte — a timing side
+    // channel for a receiver's own verification of an attacker-controlled header. Lengths already
+    // match here (both are 64-hex/32-byte SHA-256 digests, `given` regex-anchored to that length),
+    // so timingSafeEqual's equal-length requirement is always satisfied.
+    return expected.length === given.length && timingSafeEqual(expected, given);
   }
 
   /**

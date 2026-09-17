@@ -37,13 +37,18 @@ Engine: SQLite via Node's built-in `node:sqlite` (`DatabaseSync`), no native mod
 `DB_PATH` (default `./data/notify.db`; `:memory:` in tests). Pragmas set on open: `journal_mode =
 WAL`, `synchronous = NORMAL`, `busy_timeout = 5000`, `foreign_keys = ON`.
 
-Schema: one table, `messages` — `id` (PK), `api_key_id`, `idempotency_key`, `channel`
+Schema: `messages` — `id` (PK), `api_key_id`, `idempotency_key`, `channel`
 (`email`/`webhook`), `payload` (JSON text), `status` (`queued`/`processing`/`sent`/`failed`),
 `attempts`, `max_attempts`, `next_attempt_at`, `locked_until`, `last_error`, `provider_id`,
-`created_at`, `updated_at`, `sent_at`. Four indexes: a unique index on
+`created_at`, `updated_at`, `sent_at`, and, since Stage 6, `owner_token` (the fencing token of
+whoever currently holds the lock; null when not `processing`). Four indexes: a unique index on
 `(api_key_id, idempotency_key)` where the key is not null (idempotency enforcement), `(status,
 next_attempt_at)` for claiming due work, `(api_key_id, created_at DESC, id DESC)` for listing, and
-`(status, updated_at)` for the retention purge scan.
+`(status, updated_at)` for the retention purge scan. A second migration (Stage 6) adds
+`owner_token` and a new `worker_heartbeat` table — one row per live worker process (`instance`
+primary key, `seen_at`), written on a timer by any process running a `Worker` loop and read by an
+API-only process's `/ready` and `/metrics` in place of the in-process `Worker` object it doesn't
+have.
 
 Migration mechanism: `Database.MIGRATIONS` is an ordered, append-only array of SQL strings.
 `PRAGMA user_version` tracks how many have been applied. On every open, `#migrate()` runs each
@@ -70,45 +75,67 @@ no-op against the `json:` dev transport); `WebhookChannel` does not override `ve
 inherits the base `Channel`'s no-op and is effectively never checked. The result is cached in
 `this.readyCache` for `NotifyApi.READY_CACHE_MS` = `30_000` ms — a hardcoded constant, not
 environment-configurable. A request inside that 30 s window reuses the cached outcome rather than
-re-probing. Returns `200 {status:'ok'}` when the cached check passed, `503
-{status:'unavailable', error}` when it last failed. Safe to poll: no state mutation, nothing
+re-probing. Returns `200 {status:'ok', worker:'running'|'stopped'}` when the cached check passed,
+`503 {status:'unavailable', error}` when it last failed. Safe to poll: no state mutation, nothing
 discarded — the only side effect is, at most once per 30 s, a DB read and an SMTP handshake
 attempt, neither of which writes to the `messages` table or touches queued work.
+
+The `worker` field (Stage 6) is DB-backed in every role, unlike `scheduler`/`webhook-out`: notify's
+readiness/stats never read an in-process `Worker` field even before this stage, so there was no
+role-dependent branch to add — `NotifyApi#workerStatus()` always reads the `worker_heartbeat`
+table's most recent row and reports `"running"` when it is fresher than `HEARTBEAT_MS * 4`
+(`NotifyApi.PRESENCE_STALE_FACTOR`), `"stopped"` otherwise (including "no worker has ever reported
+in this database").
 
 ## Graceful shutdown
 Signals: `SIGTERM` and `SIGINT` both call `Application#shutdown(reason)`; `unhandledRejection`
 logs fatal and also calls `shutdown()`; `uncaughtException` calls `process.exit(1)` directly with
 no graceful path. `shutdown()` is guarded by a `shuttingDown` flag, so a second signal is a no-op.
 
-Order, as written in `src/application.js` (verified against the file, not assumed):
-1. `await this.app?.close()` — Fastify stops accepting new connections and runs its own close
-   lifecycle.
-2. `await this.audit.close()` — stops the flush timer and performs one final `flush()`, using the
-   same retry/backoff as a normal flush.
-3. `await this.worker?.stop()` — stops claiming new work, aborts the poll-sleep, and awaits the
-   worker's in-flight loop promise, so any deliveries already claimed in the current batch finish.
+Order, as written in `src/application.js` (Stage 6 fixed this order — see below for what it was and
+why):
+1. `this.worker?.stopClaiming()` — flips a flag `#pass()` checks before claiming new messages;
+   whatever is already in flight keeps running. Present only when this process runs a worker at
+   all (skipped in the API-only role, which has no `Worker`).
+2. `await this.app?.close()` — Fastify stops accepting new connections and runs its own close
+   lifecycle. Present only in the API and combined roles.
+3. `await this.worker?.stop()` — (redundant `running = false`) awaits the worker's in-flight loop
+   promise and every in-flight send (`Promise.allSettled(this.inFlight)`), clearing each one's
+   heartbeat interval as it settles.
 4. `for (const ch of this.channels) ch.close()` — `EmailChannel` closes its pooled SMTP
    connections; `WebhookChannel` has no `close()` override, so it's a no-op.
-5. `this.db.close()`.
+5. `await this.audit.close()` — stops the flush timer and performs one final `flush()`, using the
+   same retry/backoff as a normal flush.
+6. `this.db.close()`.
+
+**Before Stage 6** step 5 (audit flush) was step 2, running *before* the worker drained — see
+`scheduler`'s identical fix for the general reasoning (a message finishing during drain and
+needing to record an audit event could queue it into an already-flushed, already-stopped buffer).
 
 On success: `process.exit(0)`. Force-exit timeout: a `setTimeout(...).unref()` set to
-`this.config.lockTtlMs` — i.e. the **`LOCK_TTL_MS`** environment variable (default `120_000` ms =
-120 s), read directly off `this.config.lockTtlMs` in the file. It is not a dedicated shutdown
-timeout variable and not `WORKER_POLL_MS`.
+**`this.config.lockTtlMs + 10_000`** (Stage 6 added the `+10_000` margin, matching
+`scheduler`/`webhook-out`'s identical pattern — previously exactly `lockTtlMs` with no margin) —
+default `120_000 + 10_000 = 130_000` ms. `LOCK_TTL_MS` is now bounded (`config.js`, `max: 600_000`;
+previously unbounded) for the same reason `scheduler`'s `MAX_TIMEOUT_MS` is bounded: so
+`ecosystem.config.cjs`'s static `kill_timeout` can be derived once and stay valid for every value
+config validation allows.
 
-Comparison with PM2: `ecosystem.config.cjs` sets `kill_timeout: 60000` (60 s), with a comment
-assuming that's enough because "SMTP socket timeout is 30s". The app's own internal force-exit
-only fires after 120 s by default — twice as long as PM2's `kill_timeout`. In practice this means
-PM2's SIGKILL, not the app's own force-exit, is the effective ceiling on shutdown time in
-production, and it is half of what the app internally assumes it has before it force-exits itself.
-This is a real mismatch in the current configuration, documented here rather than fixed (see
-"Known failure modes").
+Comparison with PM2: `ecosystem.config.cjs` now sets `kill_timeout: 630000` (630 s; was a static
+`60000` that the app's own 120 s default force-exit timer already exceeded — a real, previously
+documented mismatch). `630_000 = 600_000 (LOCK_TTL_MS max) + 10_000 (force-exit margin) + 20_000`
+(drain/flush/close headroom on top of the force-exit timer itself) — comfortably above the worst
+case the force-exit timer can now reach (`610_000` ms) regardless of how `LOCK_TTL_MS` is
+configured within its validated range. This closes the mismatch the previous revision of this
+document described under "Known failure modes".
 
 ## Resource limits
 - `BODY_LIMIT` (default `65536` bytes): Fastify `bodyLimit`, enforced on every request — confirmed
   in `app.test.js` (`413` on an oversized body).
-- `WORKER_CONCURRENCY` (default `5`): maximum messages claimed and delivered concurrently per
-  worker pass (`queue.claim(concurrency)`).
+- `WORKER_CONCURRENCY` (default `5`): maximum messages in flight at once, via a rolling pool
+  (`inFlight` `Set`) — Stage 6 fix. Before Stage 6 this was a fixed batch awaited with
+  `Promise.all`: claiming `concurrency` messages together and not claiming more until the whole
+  batch settled, so one slow send idled the rest of the pool's slots until it finished. The rolling
+  pool claims a replacement as soon as any individual send's own promise resolves.
 - List page size: `GET /v1/messages` `limit` query param, schema-restricted to `1`–`100`, defaults
   to `20` in the handler when omitted.
 - `max_memory_restart: '300M'` in `ecosystem.config.cjs` — PM2 restarts the process if its RSS
@@ -118,9 +145,13 @@ This is a real mismatch in the current configuration, documented here rather tha
 - Email address lists (`to`/`cc`/`bcc`): at most 10 addresses each.
 
 ## Timeouts
-- `WEBHOOK_TIMEOUT_MS` (default `10_000` ms, min `1000`, max `lockTtlMs / 2`): Node
-  `http`/`https` request timeout for an outbound webhook POST. On fire: `WebhookError` with
-  `retryable: true`, `code: 'TIMEOUT'` — retried per the backoff policy.
+- `WEBHOOK_TIMEOUT_MS` (default `10_000` ms, min `1000`, max `120_000` — Stage 6 changed the cap
+  from `lockTtlMs / 2` to a fixed ceiling): Node `http`/`https` request timeout for an outbound
+  webhook POST. On fire: `WebhookError` with `retryable: true`, `code: 'TIMEOUT'` — retried per the
+  backoff policy. The old cap existed because a send lasting more than half the lock's TTL risked
+  losing the lock before it could finish (there was no heartbeat to renew it); the heartbeat
+  (`HEARTBEAT_MS`, below) now protects a long send regardless of how `WEBHOOK_TIMEOUT_MS` and
+  `LOCK_TTL_MS` relate to each other, so the two no longer need to be coupled.
 - SMTP transport (real SMTP only, not `json:`): `connectionTimeout` 10 000 ms, `greetingTimeout`
   10 000 ms, `socketTimeout` 30 000 ms — all hardcoded in `EmailChannel.createTransport`, not
   environment-configurable. A timeout surfaces from nodemailer without a numeric `responseCode`,
@@ -130,10 +161,16 @@ This is a real mismatch in the current configuration, documented here rather tha
   (`AbortSignal.timeout`) — a constructor default in `AuditClient`, not wired to any env var from
   `Application` (only `target` is passed in; `flushMs`=2000, `batchSize`=200 and `timeoutMs`=5000
   all stay at their built-in defaults today).
-- `LOCK_TTL_MS` (default `120_000` ms): how long a claimed (`processing`) message may stay locked
-  before the worker's periodic maintenance (`reapStale`) returns it to the queue as if the worker
-  had crashed mid-delivery. It also backs the graceful-shutdown force-exit delay (see above) — one
-  env var serving two purposes.
+- `LOCK_TTL_MS` (default `120_000` ms, range `5_000`–`600_000`, upper bound added in Stage 6): how
+  long a claimed (`processing`) message's lease lasts without a heartbeat before it becomes
+  reclaimable as a failed attempt (`Queue#reclaimExpired`, previously `reapStale`'s unconditional
+  free reset). It also backs the graceful-shutdown force-exit delay (see above) — one env var
+  serving two purposes, unchanged from before Stage 6.
+- `HEARTBEAT_MS` (default `10_000` ms, `min` 250, must be `< LOCK_TTL_MS`) — Stage 6. How often an
+  in-flight send's lock is renewed (`Worker#execute`'s `setInterval`, cleared once the send
+  settles). Deliberately independent of `WEBHOOK_TIMEOUT_MS`/SMTP's own hardcoded timeouts — a send
+  can run far longer than `LOCK_TTL_MS` without losing its lock, as long as its heartbeat keeps
+  succeeding. See "Lease ownership".
 
 ## Retry policy
 - **Queued deliveries** (`src/queue.js`, `Backoff` class + `Queue.markFailure`): exponential
@@ -153,12 +190,22 @@ This is a real mismatch in the current configuration, documented here rather tha
   state (`409` otherwise).
 
 ## Idempotency
-- `POST /v1/messages` **with** `idempotencyKey`: safe to repeat. Enforced by a real database
-  constraint (`UNIQUE INDEX messages_idempotency ON messages (api_key_id, idempotency_key) WHERE
-  idempotency_key IS NOT NULL`); the insert uses `ON CONFLICT ... DO NOTHING` and then re-reads the
-  existing row (`Queue.enqueue`), verified by `queue.test.js`. **Without** `idempotencyKey`, two
-  identical POSTs create two separate messages — not idempotent by design; the API does not
-  pretend otherwise.
+- `POST /v1/messages` **with** `idempotencyKey`, same channel and payload as the original: safe to
+  repeat. Enforced by a real database constraint (`UNIQUE INDEX messages_idempotency ON messages
+  (api_key_id, idempotency_key) WHERE idempotency_key IS NOT NULL`); the insert uses `ON CONFLICT
+  ... DO NOTHING` and then re-reads the existing row (`Queue.enqueue`), verified by
+  `queue.test.js`.
+- `POST /v1/messages` **with** the same `idempotencyKey` but a DIFFERENT channel or payload: Stage
+  6 fix — `409 IDEMPOTENCY_CONFLICT` (`IdempotencyConflictError`), not a silent `200` with the
+  stale original content. Before Stage 6, `enqueue()` never compared the replay's payload against
+  the stored row at all, so a key reused for a different send would appear to succeed while
+  actually sending nothing new — a caller could not tell it happened. Comparison is exact
+  `JSON.stringify` equality of the stored vs. incoming payload, not a deep-equal — a byte-identical
+  re-send (the common case: the same call retried) always matches; a semantically-equal but
+  differently-ordered object would not, which is an intentional simplicity trade-off, not a
+  correctness gap for the retry-safety this exists for.
+- **Without** `idempotencyKey`, two identical POSTs create two separate messages — not idempotent
+  by design; the API does not pretend otherwise.
 - `GET /v1/messages`, `GET /v1/messages/:id`, `GET /v1/templates`: naturally idempotent reads.
 - `POST /v1/messages/:id/retry`: **not** safe to repeat in the sense of "fire twice, same effect."
   It is guarded by state (`409` unless the message is currently `failed`), but each successful call
@@ -253,57 +300,90 @@ and per-template `data` validated against that template's own compiled schema. E
 scope, per the README's "Out of scope by design": SMS/push channels and attachments; key rotation
 tooling and RBAC are absent but not explicitly called out there either — noted here instead.
 
+## API/worker runtime split
+Stage 6 adds two more entry points alongside the default combined one — `src/api-main.js` (HTTP
+only, no `Worker`, never claims a message) and `src/worker-main.js` (`Worker` only, no HTTP
+listener at all). `Application`'s `role` constructor option (`'combined'` default, `'api'`,
+`'worker'`) picks which parts get built; `Config`, the database, and the migrations are identical
+across all three. `ecosystem.config.cjs` ships the split apps commented out, ready to enable.
+
+## Lease ownership
+Every claimed batch of messages gets, in addition to `status = 'processing'`: **`owner_token`** — a
+fresh random value per `claim()` *call* (not per row: the whole batch shares one token, since every
+fencing check is already scoped by `id` in its `WHERE` clause, so a shared token is exactly as safe
+as a per-row one and simpler) — and **`locked_until`**, renewed every `HEARTBEAT_MS` while a send
+is in flight. `Queue#markSent`/`Queue#markFailure` are guarded by `WHERE id = ? AND owner_token = ?
+AND status = 'processing'`, so a worker that hung long enough to be reclaimed by someone else can
+never overwrite the row when it eventually returns. `Queue#reclaimExpired` (called by
+`Worker#recover()` at startup, labeled `"interrupted by restart"`, and by the in-loop
+`#reclaimStale()` on every poll pass, labeled `"lease expired"`) reads every row whose lock has
+expired and settles each one as a failed attempt — through the SAME `markFailure` path an ordinary
+send failure uses, so it costs an attempt and follows the normal backoff/exhaustion schedule —
+inside one transaction with every write, the same race-free construction as `scheduler`'s identical
+primitive (see its README for the full "why one transaction" reasoning).
+
+**What changed from before Stage 6**: `reapStale()` reset every expired-lock row straight back to
+`queued` for free, with no attempt cost and no fencing check on the row it touched (there was no
+`owner_token` at all). A worker that crashed repeatedly on the same message could have it reaped
+and reclaimed indefinitely without `max_attempts` ever being enforced against that path — only
+against genuine send failures. `reclaimExpired` closes that gap by routing reclaim through the same
+attempt-counting path as any other failure.
+
 ## Scaling model
-**B — single-node stateful.** One process owns one SQLite (`node:sqlite`) file at `DB_PATH`.
-`ecosystem.config.cjs` hardcodes `instances: 1`, with a comment explaining why: "one process per
-SQLite file; the delivery worker runs in-process." Two instances pointed at the same file: message
-claiming itself would not double-deliver — `Queue.claim()` is a single atomic `UPDATE ... WHERE id
-IN (SELECT ...) RETURNING`, and SQLite serializes writers (with `busy_timeout=5000` absorbing brief
-contention), a point the README already makes ("claims are atomic, so it works, but the intended
-deployment is one instance per database"). What is *not* safe or coordinated: two processes racing
-`#migrate()` on a brand-new database file at simultaneous first boot (no lock around it), and two
-processes both running the 60-second maintenance pass (`reapStale`/`purge`) redundantly against the
-same file — harmless but wasted work, not a supported scale-out path. Real horizontal scaling needs
-a server database, as the README already states ("Move to Postgres if you need horizontal
-scaling").
+**B — single-node stateful, but "single-node" now means one HOST, not one PROCESS.** One SQLite
+(`node:sqlite`) file at `DB_PATH`. `ecosystem.config.cjs`'s default (combined) app still pins
+`instances: 1`, but the commented-out split `notify-worker` app documents raising its own
+`instances` above 1 as a supported topology.
+
+Two (or more) worker processes pointed at the same file: message claiming itself does not
+double-deliver — `Queue.claim()` is a single atomic `UPDATE ... WHERE id IN (SELECT ...)
+RETURNING`, proven with real cross-connection concurrency (not same-process `Promise.all`) in
+`test/lease-concurrency.test.js` — and the lease/fencing model above means a crash in one worker is
+reclaimed by any live sibling's next poll pass. What is *still* not coordinated: two processes
+racing `#migrate()` on a brand-new database file at simultaneous first boot (no lock around it) —
+an operational concern for the very first start of a fresh deployment, not an ongoing runtime one.
+Real horizontal scaling across *hosts* still needs a server database, as the README states.
 
 ## Single-node / multi-node guarantees
-Running the documented single instance: full guarantees hold — atomic claim (no double-delivery
-via the claim mechanism itself, modulo the stale-lock reap window described in "Known failure
-modes"), idempotency-key dedup on creation, and consistent retry/backoff state.
-
-Running more than one instance against the same `DB_PATH` file is not structurally prevented by the
-code, though it is not the documented deployment. If it happened: claims still would not
-double-deliver the same row (the atomic `UPDATE ... RETURNING` guarantees that), but there is no
-additional coordination beyond that — no leader election, no per-instance lease beyond the
-row-level `locked_until`. Both instances would compete for the same claim batches (wasted work, not
-corruption), both would run maintenance redundantly, and a simultaneous first boot against a new,
-empty database file would race the migration step unguarded.
+Running the documented single (combined) instance: full guarantees hold as always. Running several
+worker processes against the same `DB_PATH` file (Stage 6's split-deployment topology) is now a
+supported configuration: claims still never double-deliver the same row, and a crash in one worker
+is now reclaimed by any live sibling, not only by that same process restarting — the difference
+Stage 6 makes. Both/all instances compete for the same claim batches under real SQLite write-lock
+serialization (not corruption, just contention under very high claim rates), and a simultaneous
+first boot against a brand-new, empty database file still races the migration step unguarded — start
+one instance first, let it complete its migration, before scaling out workers against that file.
 
 ## Known failure modes
 - **Disk full.** A SQLite write (`INSERT`/`UPDATE`, including a WAL checkpoint) throws from
   `node:sqlite`'s `DatabaseSync`. On the HTTP path this reaches `NotifyApi`'s generic error handler
-  (`status >= 500`, logged as `unhandled error`, `INTERNAL_ERROR` returned). On the worker path,
-  `Worker#deliver`'s `try/catch` wraps `channel.deliver()` and, in the failure branch, the
-  `queue.markFailure()` call that records the outcome — so a disk-full error *while recording a
-  failed delivery* propagates up out of `#deliver` entirely, uncaught inside that method, and is
-  only caught by `#run()`'s own top-level `try/catch` (logged as `worker iteration failed`, loop
-  continues). The practical effect: that message's in-memory delivery outcome for that attempt is
-  lost — it stays `processing` until its lock expires and `reapStale` returns it to the queue,
-  which can mean an actually-successful email or webhook gets retried.
-- **A dependency times out mid-request.** For SMTP/webhook: handled as designed — classified
-  retryable or not per channel, backoff applied (see worker.test.js's `/slow` and permanent-vs-
-  transient cases). For the audit service: no impact on the business request at all, since
-  `record()` only appends to an in-memory buffer synchronously; the network call happens later, off
-  the request path.
+  (`status >= 500`, logged as `unhandled error`, `INTERNAL_ERROR` returned). On the worker path
+  (Stage 6 restructured `#execute`/`#deliver`, but the shape of this risk is unchanged): the single
+  `queue.markSent`/`queue.markFailure` write that records an attempt's outcome can itself throw,
+  uncaught inside `#execute`, propagating to whichever `Promise.allSettled`/loop-level handling
+  observes it — the practical effect is the same as before: that attempt's outcome is lost, the
+  message stays `processing` until its lock expires and gets reclaimed, which can mean an
+  actually-successful send gets retried.
+- **Heartbeat failure while a send is genuinely still in flight** (event loop stall, a slow/busy DB
+  write for the heartbeat `UPDATE` itself): Stage 6. The heartbeat's own guarded write detects the
+  lost lock and logs a warning immediately, but cannot cancel the outbound SMTP/HTTP call already
+  in progress. If the lock then expires and another process reclaims the message, the original
+  call's eventual `markSent`/`markFailure` is rejected by the same `owner_token`/`status` guard
+  (logged, not thrown) — its result is discarded, and the reclaim's own "lease expired" failed-
+  attempt outcome is what stands. A genuinely successful send whose heartbeat failed can be
+  silently wasted from the recipient's point of view and retried.
+- **A dependency times out mid-request.** Unchanged: for SMTP/webhook, handled as designed —
+  classified retryable or not per channel, backoff applied. For the audit service: no impact on the
+  business request at all, since `record()` only appends to an in-memory buffer synchronously.
 - **The process is killed without a graceful shutdown** — SIGKILL, an OOM restart via
-  `max_memory_restart`, or (see "Graceful shutdown" above) PM2's `kill_timeout` (60 s) elapsing
-  before the app's own internal force-exit (`LOCK_TTL_MS`, default 120 s) would have fired. Any
-  message still `processing` at the moment of the kill stays stuck in `processing` — not retried,
-  not visible as failed — until the next process start calls `reapStale()`, or a running instance's
-  own periodic maintenance reaches it, up to `LOCK_TTL_MS` after the crash. Any audit events still
-  sitting in `AuditClient.buffer` (unflushed, capacity `MAX_BUFFER` = 5000) are lost outright: the
-  buffer is in-memory only, never persisted to disk.
-- **Two instances run against one file.** As above: no corruption from double-delivery, but
-  duplicated/wasted maintenance work every 60 s from both instances, and an unguarded migration
-  race if both start against a brand-new, empty database file at the same instant.
+  `max_memory_restart`. Any message still `processing` at the moment of the kill is no longer stuck
+  until the *same* process restarts: since Stage 6, the in-loop `#reclaimStale()` sweep reclaims it
+  on the next poll pass of *any* live worker process (this one restarting, or a sibling in a
+  multi-worker deployment), at most `LOCK_TTL_MS` after the kill. Any audit events still sitting in
+  `AuditClient.buffer` (unflushed, capacity `MAX_BUFFER` = 5000) are still lost outright either
+  way — the buffer is in-memory only, never persisted to disk; unaffected by Stage 6.
+- **Multiple worker processes running against one file.** Stage 6: now a supported topology (see
+  "Scaling model"), not a failure mode — listed here only to be explicit that it no longer is one.
+  The remaining, expected cost under high contention is write-lock contention
+  (`busy_timeout = 5000` ms), and an unguarded migration race specifically at simultaneous first
+  boot against a brand-new database file (see "Scaling model").

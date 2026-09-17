@@ -1,6 +1,7 @@
 import { EmailChannel } from '../src/channels/email.js';
 import { Config } from '../src/config.js';
 import { Database } from '../src/db.js';
+import { HeartbeatStore } from '../src/heartbeat-store.js';
 import { NetGuard } from '../src/net-guard.js';
 import { Backoff, Queue } from '../src/queue.js';
 import { TemplateRegistry } from '../src/templates/registry.js';
@@ -38,6 +39,11 @@ export function testQueue(config) {
     lockTtlMs: config.lockTtlMs,
     backoff: new Backoff(config.backoffBaseMs, config.backoffCapMs),
   });
+}
+
+/** Fresh worker_heartbeat store over its own in-memory database. */
+export function testPresence() {
+  return new HeartbeatStore(new Database(':memory:'));
 }
 
 export const templates = TemplateRegistry.withDefaults();
