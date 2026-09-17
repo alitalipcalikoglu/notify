@@ -157,6 +157,29 @@ Class-based; dependencies are injected through constructors, `src/application.js
 
 With `AUDIT_URL` and `AUDIT_API_KEY` set, every completed write request is forwarded to the audit service as one event (`success`, or `denied` on 403) with the calling key as actor, the affected entity as target, client IP, user agent and request id. Events are buffered and sent in batches; the audit service being down never fails a request. Actions: see [examples/audit-events.md](examples/audit-events.md).
 
+## Scaling model
+
+One process owns one SQLite file (`DB_PATH`); `ecosystem.config.cjs` hardcodes `instances: 1` for
+that reason. Message claiming is a single atomic SQL statement, so a second instance against the
+same file would not double-deliver, but nothing coordinates migrations or maintenance across
+instances — it is not a supported scale-out path. Horizontal scaling means moving to a server
+database. See [docs/READINESS.md](docs/READINESS.md) for the full contract.
+
+## Observability
+
+`notify` accepts and logs whatever `X-Request-Id` a caller sends (generating one when absent) but
+does not yet parse, generate or forward `traceparent` — that is implemented in `gateway` only, per
+the platform's [OBSERVABILITY.md](../stack/docs/OBSERVABILITY.md). Outbound SMTP sends and webhook
+POSTs carry `X-Notify-Id` but no request-id or trace header. See
+[docs/READINESS.md](docs/READINESS.md) for the full contract.
+
+## Backup / restore
+
+The only state to protect is the SQLite file at `DB_PATH` (WAL mode, so its `-wal`/`-shm`
+companions matter too); there is no built-in backup or restore tooling today, so capturing and
+restoring it is a manual file copy with the process stopped. See
+[docs/READINESS.md](docs/READINESS.md) for the full contract.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
