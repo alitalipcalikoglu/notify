@@ -159,13 +159,15 @@ export class Worker {
     const channel = this.channels.get(row.channel);
     try {
       if (!channel) throw Object.assign(new Error(`no channel registered for "${row.channel}"`), { retryable: false });
-      // Stage 6.1: the line between "claimed" and "attempted" — see Queue#reclaimExpired. If the
-      // lease is already gone by this point (extremely rare: reclaimed between claim and here),
-      // don't start the external call at all — a concurrent reclaim may already be retrying this
-      // same message, and starting our own send too would risk a genuinely duplicate delivery for
-      // no benefit, since our own result could never be recorded anyway.
+      // Stage 6.1: the delivery-attempt-start boundary — see Queue#reclaimExpired. If the lease is
+      // already gone by this point (extremely rare: reclaimed between claim and here), don't start
+      // the external call at all — a concurrent reclaim may already be retrying this same message,
+      // and starting our own send too would risk a genuinely duplicate delivery for no benefit,
+      // since our own result could never be recorded anyway. Stage 6.2 note: this write landing
+      // does not itself prove `channel.deliver()` below ever runs — a crash in the next line is
+      // still possible and is deliberately counted as a real attempt anyway (see Queue#reclaimExpired).
       if (!this.queue.markCallStarted(row.id, ownerToken, this.now())) {
-        this.log.warn(meta, 'lock lost before the external call could start; not sending, another worker already reclaimed it');
+        this.log.warn(meta, 'lock lost before the delivery-attempt boundary; not sending, another worker already reclaimed it');
         return;
       }
       const providerId = await channel.deliver(row.id, JSON.parse(row.payload));

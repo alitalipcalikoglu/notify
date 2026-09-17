@@ -344,16 +344,24 @@ race-free construction as `scheduler`'s identical primitive (see its README for 
 transaction" reasoning). What it does with each expired row now depends on `call_started_at`
 (Stage 6.1, `messages.call_started_at`, set by `Worker#deliver()` right before the channel's
 `deliver()` call, cleared on every write leaving `'processing'`):
-- **`call_started_at IS NULL`** — the external SMTP/webhook call never started; this was an
-  infra-only crash between claim and send (process killed, container rescheduled, etc.) with the
-  message never actually attempted. Released back to `'queued'` for free — `next_attempt_at = now`
-  (immediately due again, no backoff) and **no attempt cost** — via the same fencing-guarded
-  release path `#release()` uses internally.
-- **`call_started_at` is set** — the external call started and its outcome is unknown (the process
-  died, or is merely unreachable, sometime between the call starting and a `sent`/`failed` write
-  landing). Settled as a failed attempt through the same `markFailure` path an ordinary send
-  failure uses — it costs an attempt and follows the normal backoff/exhaustion schedule, exactly as
-  before Stage 6.1.
+- **`call_started_at IS NULL`** — the process never reached the delivery-attempt boundary at all;
+  an infra-only crash between claim and that point (process killed, container rescheduled, etc.)
+  with the message never actually attempted. Released back to `'queued'` for free —
+  `next_attempt_at = now` (immediately due again, no backoff) and **no attempt cost** — via the
+  same fencing-guarded release path `#release()` uses internally.
+- **`call_started_at` is set** — the process crossed the delivery-attempt boundary; its outcome is
+  unknown. Settled as a failed attempt through the same `markFailure` path an ordinary send failure
+  uses — it costs an attempt and follows the normal backoff/exhaustion schedule, exactly as before
+  Stage 6.1.
+
+**Stage 6.2 correction — what `call_started_at IS NOT NULL` does and does not prove**: the write
+happens right before `Worker#deliver()` invokes `channel.deliver()`, not right after. A non-NULL
+value proves the process reached that line; it does NOT prove the external SMTP send or webhook
+POST itself ever started — the process can still crash in the gap between the `call_started_at`
+write committing and `channel.deliver()` actually running. That gap is deliberately folded into the
+"real attempt" bucket rather than given a third state: the column marks "attempt intent recorded,
+external outcome unknown," and counting it as a real attempt is a conservative choice (it may cost
+budget for a send that never actually went out), not a claim that delivery definitely began.
 
 **What changed from before Stage 6**: `reapStale()` reset every expired-lock row straight back to
 `queued` for free, with no attempt cost and no fencing check on the row it touched (there was no
@@ -364,13 +372,14 @@ attempt-counting path as any other failure — **unconditionally**, at the time.
 
 **What changed again in Stage 6.1**: routing every reclaim through `markFailure` unconditionally was
 itself a real gap in the other direction — a process that crashes repeatedly right after claiming a
-message, before ever calling out to SMTP/the webhook target, could exhaust `max_attempts` on pure
-infrastructure churn with the message never actually sent once. `call_started_at` draws the exact
-line: "claimed" alone costs nothing; "the external call started" is what counts as a real attempt.
-This still does not claim exactly-once delivery — if the external call actually succeeded but the
-process died before the `sent` write landed, `call_started_at` was already set, so the reclaim
-counts it as a failed attempt and a duplicate send is still possible on retry. Stage 6.1 only
-guarantees retry budget is never consumed by a crash that never reached the external side effect.
+message, before ever reaching the delivery-attempt boundary, could exhaust `max_attempts` on pure
+infrastructure churn with the message never actually sent once. `call_started_at` draws the line:
+"claimed" alone costs nothing; crossing the delivery-attempt boundary is what counts as a real
+attempt. This still does not claim exactly-once delivery in either direction — a message can be
+sent more than once (the external call actually succeeded, then the process died before the `sent`
+write landed), or, in the conservative case above, retried once for a send whose external call
+never actually ran. Stage 6.1/6.2 only guarantee retry budget is never consumed by a crash that
+never reached the delivery-attempt boundary at all.
 
 ## Scaling model
 **B — single-node stateful, but "single-node" now means one HOST, not one PROCESS.** One SQLite

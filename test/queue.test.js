@@ -98,10 +98,11 @@ test('markFailure re-queues with backoff, fails after max attempts or when final
   assert.equal(q.retry(retried.id, 'a', 10), undefined, 'only failed rows can be retried');
 });
 
-test('reclaimExpired: the external call having started decides free release vs. a real failed attempt (Stage 6.1)', () => {
+test('reclaimExpired: crossing the delivery-attempt-start boundary decides free release vs. a real failed attempt (Stage 6.1)', () => {
   const q = testQueue(config);
 
-  // Crash BEFORE the external call started: infra-only crash, free retry, no attempt cost.
+  // Crash before ever reaching the delivery-attempt boundary: infra-only crash, free retry, no
+  // attempt cost.
   const { row: neverStarted } = q.enqueue({ apiKeyId: 'a', channel: 'webhook', payload }, 0);
   const [claimedA] = q.claim(1, 0);
   assert.equal(claimedA.call_started_at, null);
@@ -110,14 +111,15 @@ test('reclaimExpired: the external call having started decides free release vs. 
   assert.equal(releasedA.length, 1);
   assert.equal(releasedA[0].status, 'queued');
   assert.equal(releasedA[0].attempts, 0, 'never attempted: no attempt cost');
-  assert.match(String(releasedA[0].last_error), /before the external call started/);
+  assert.match(String(releasedA[0].last_error), /never reached the delivery-attempt boundary/);
   assert.equal(releasedA[0].next_attempt_at, config.lockTtlMs + 1, 'immediately due again, no backoff');
   // The original claim's owner_token no longer owns the row after release — a late finish() must
   // not overwrite the release outcome.
   assert.equal(q.markSent(neverStarted.id, /** @type {string} */ (claimedA.owner_token), 'late', config.lockTtlMs + 2), false);
 
-  // Crash AFTER the external call started (outcome unknown): a real attempt, costs the budget,
-  // follows the normal backoff schedule — same as any other failure.
+  // Crash after crossing the boundary (call_started_at landed, external outcome unknown — this
+  // does NOT prove the SMTP/webhook call itself ever ran): a real attempt, costs the budget,
+  // follows the normal backoff schedule — same as any other failure. Conservative by design.
   const { row: started } = q.enqueue({ apiKeyId: 'a', channel: 'webhook', payload }, 100_000);
   const [claimedB] = q.claim(1, 100_000);
   assert.equal(q.markCallStarted(claimedB.id, /** @type {string} */ (claimedB.owner_token), 100_000), true);
@@ -135,6 +137,28 @@ test('reclaimExpired: the external call having started decides free release vs. 
   assert.equal(q.purge(200_000), 0, 'not strictly older');
   assert.equal(q.purge(200_001), 1);
   assert.equal(q.get(neverStarted.id, 'a'), undefined);
+});
+
+test('reclaimExpired: markCallStarted lands, then a simulated crash before channel.deliver() is ever invoked — still an attempt, not a free release (Stage 6.2)', () => {
+  const q = testQueue(config);
+  const { row } = q.enqueue({ apiKeyId: 'a', channel: 'webhook', payload }, 0);
+  const [claimed] = q.claim(1, 0);
+  const ownerToken = /** @type {string} */ (claimed.owner_token);
+
+  // The delivery-attempt boundary is crossed...
+  assert.equal(q.markCallStarted(claimed.id, ownerToken, 0), true);
+  // ...then the process dies right here, in the gap before Worker#deliver ever calls
+  // channel.deliver(). No SMTP/webhook call was ever made — but the system cannot tell that from
+  // "made the call and it's still pending", so it treats this as an unknown-outcome attempt.
+  assert.equal(q.reclaimExpired(config.lockTtlMs).length, 0, 'lease not yet expired: nothing to reclaim yet');
+
+  const reclaimed = q.reclaimExpired(config.lockTtlMs + 100);
+  assert.equal(reclaimed.length, 1);
+  assert.equal(reclaimed[0].status, 'queued', 'deterministic: back to queued with backoff, not stuck in processing');
+  assert.equal(reclaimed[0].attempts, 1, 'crossing the boundary costs an attempt even though no external call ever actually ran');
+  assert.equal(reclaimed[0].last_error, 'lease expired');
+  assert.ok(typeof reclaimed[0].next_attempt_at === 'number' && reclaimed[0].next_attempt_at > config.lockTtlMs + 100, 'normal backoff applies, same as any other failed attempt');
+  assert.equal(q.get(row.id, 'a')?.call_started_at, null, 'cleared by the reclaim write, same as any other completion');
 });
 
 test('list paginates newest first with an opaque cursor and filters by status', () => {

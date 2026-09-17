@@ -45,11 +45,15 @@ export class Database extends CoreDatabase {
     );
     `,
     `
-    -- Stage 6.1: distinguishes "claimed but the external call never started" (an infra-only crash —
-    -- release for a free retry, no attempt cost) from "the external call started, outcome unknown"
-    -- (a real attempt — reclaim costs one, same as any other failure). NULL means never started;
-    -- set once, right before the channel's deliver() call, cleared on every write that leaves
-    -- 'processing' (finish or release).
+    -- Stage 6.1: distinguishes "claimed, never reached the delivery-attempt boundary" (an
+    -- infra-only crash — release for a free retry, no attempt cost) from "crossed the boundary,
+    -- external outcome unknown" (treated as a real attempt — reclaim costs one, same as any other
+    -- failure). NULL means the boundary was never reached. Set once, right before the channel's
+    -- deliver() call; cleared on every write that leaves 'processing' (finish or release). NOTE
+    -- (Stage 6.2): a non-NULL value proves the process reached this write, NOT that the external
+    -- SMTP/webhook call itself ever ran — the process can still crash in the gap between this
+    -- write committing and deliver() actually being invoked. Counting that gap as a real attempt is
+    -- a deliberate, conservative choice, not a claim that delivery definitely started.
     ALTER TABLE messages ADD COLUMN call_started_at INTEGER;
     `,
   ];

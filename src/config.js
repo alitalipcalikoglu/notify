@@ -11,6 +11,15 @@ export { ConfigError };
 export class Config {
   static MIN_SECRET_LENGTH = 32;
 
+  // Stage 6.2: single source of truth for the two shutdown-timer margins, so `application.js`
+  // never re-derives this arithmetic by hand (that duplication is exactly how the Stage 6.1
+  // forceExitMs bug — sized off LOCK_TTL_MS instead of the real call ceiling — happened in the
+  // first place). `externalCallCeiling < drainMs < forceExitMs` holds unconditionally for any
+  // valid call ceiling — the margins are fixed, not operator-configurable — so there is no invalid
+  // combination for config validation to reject here; `test/config.test.js` locks the ordering in.
+  static DRAIN_MARGIN_MS = 5_000;
+  static FORCE_EXIT_MARGIN_MS = 10_000;
+
   /** @param {import('./types.js').ConfigValues} values */
   constructor(values) {
     this.port = values.port;
@@ -39,6 +48,18 @@ export class Config {
     this.retentionDays = values.retentionDays;
     this.rateLimitMax = values.rateLimitMax;
     Object.freeze(this);
+  }
+
+  /**
+   * Shutdown timers derived from the real worst-case external call duration (not `lockTtlMs` — see
+   * the Stage 6.1 fix in `application.js` for why the lease TTL is the wrong basis once a heartbeat
+   * decouples call duration from lease renewal). Callers pass the same `callCeilingMs`
+   * (`Math.max(EmailChannel.SMTP_WORST_CASE_MS, this.webhookTimeoutMs)`) they use to size the
+   * worker's own drain wait.
+   * @param {number} callCeilingMs
+   */
+  shutdownTimers(callCeilingMs) {
+    return { drainMs: callCeilingMs + Config.DRAIN_MARGIN_MS, forceExitMs: callCeilingMs + Config.FORCE_EXIT_MARGIN_MS };
   }
 
   /**

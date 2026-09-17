@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Config, ConfigError } from '../src/config.js';
+import { EmailChannel } from '../src/channels/email.js';
 
 const loadConfig = Config.fromEnv;
 import { testConfig } from './helpers.js';
@@ -28,6 +29,28 @@ test('rejects malformed values', () => {
 test('TLS paths are read as a pair', () => {
   const c = loadConfig({ ...fullEnv(), TLS_CERT_PATH: '/c.pem', TLS_KEY_PATH: '/k.pem' });
   assert.deepEqual(c.tls, { certPath: '/c.pem', keyPath: '/k.pem' });
+});
+
+test('Config: 0 < HEARTBEAT_MS < LOCK_TTL_MS invariant (Stage 6.2)', () => {
+  const bad = (/** @type {Record<string,string>} */ o, /** @type {RegExp} */ re) => assert.throws(() => loadConfig({ ...fullEnv(), ...o }), (e) => e instanceof ConfigError && re.test(e.message));
+  bad({ HEARTBEAT_MS: '5000', LOCK_TTL_MS: '5000' }, /HEARTBEAT_MS must be less than LOCK_TTL_MS/);
+  bad({ HEARTBEAT_MS: '6000', LOCK_TTL_MS: '5000' }, /HEARTBEAT_MS must be less than LOCK_TTL_MS/);
+  bad({ HEARTBEAT_MS: '0' }, /HEARTBEAT_MS must be >= 250/);
+  bad({ LOCK_TTL_MS: '0' }, /LOCK_TTL_MS must be >= 5000/);
+  const c = loadConfig({ ...fullEnv(), HEARTBEAT_MS: '1000', LOCK_TTL_MS: '5000' });
+  assert.equal(c.heartbeatMs, 1_000);
+  assert.equal(c.lockTtlMs, 5_000);
+});
+
+test('Config: externalCallCeiling < drainMs < forceExitMs across the whole WEBHOOK_TIMEOUT_MS range (Stage 6.2)', () => {
+  for (const webhookTimeoutMs of [1_000, 10_000, 120_000]) {
+    const c = loadConfig({ ...fullEnv(), WEBHOOK_TIMEOUT_MS: String(webhookTimeoutMs) });
+    const callCeilingMs = Math.max(EmailChannel.SMTP_WORST_CASE_MS, c.webhookTimeoutMs);
+    const { drainMs, forceExitMs } = c.shutdownTimers(callCeilingMs);
+    assert.equal(drainMs, callCeilingMs + 5_000);
+    assert.equal(forceExitMs, callCeilingMs + 10_000);
+    assert.ok(callCeilingMs < drainMs && drainMs < forceExitMs);
+  }
 });
 
 function fullEnv() {

@@ -110,11 +110,11 @@ export class Queue {
         RETURNING ${C}`),
       sent: db.prepare(`
         UPDATE messages SET status = 'sent', provider_id = ?, locked_until = NULL, owner_token = NULL, last_error = NULL,
-          sent_at = ?, updated_at = ?
+          call_started_at = NULL, sent_at = ?, updated_at = ?
         WHERE id = ? AND status = 'processing' AND owner_token = ?`),
       failure: db.prepare(`
         UPDATE messages SET attempts = attempts + 1, status = ?, next_attempt_at = ?, locked_until = NULL, owner_token = NULL,
-          last_error = ?, updated_at = ?
+          call_started_at = NULL, last_error = ?, updated_at = ?
         WHERE id = ? AND status = 'processing' AND owner_token = ?
         RETURNING ${C}`),
       heartbeat: db.prepare(`UPDATE messages SET locked_until = ? WHERE id = ? AND owner_token = ? AND status = 'processing'`),
@@ -216,13 +216,19 @@ export class Queue {
   }
 
   /**
-   * Mark that the external call (SMTP send / webhook POST) is actually about to start — the line
-   * between "claimed" and "attempted." Stage 6.1: this is what lets {@link reclaimExpired} tell an
-   * infra-only crash (worker died between claim and this call, message never actually attempted)
-   * from a real failed attempt (the external call started; its outcome is unknown). Returns
+   * Mark that the message has crossed the delivery-attempt start boundary, right before invoking
+   * the channel's `deliver()` — the line between "claimed" and "attempted." Stage 6.1: this is what
+   * lets {@link reclaimExpired} tell a pure infra crash (worker died before this write ever landed,
+   * message never got even this far) from a real attempt (this write landed). **Important:** a
+   * landed `call_started_at` is proof the process reached this call, NOT proof the external
+   * SMTP/webhook side effect itself ran — the process can still crash in the gap between this write
+   * committing and `channel.deliver()` actually being invoked (see `Worker#execute`), and that gap
+   * is deliberately folded into the "real attempt" bucket rather than given its own third state.
+   * `call_started_at IS NOT NULL` therefore means "attempt intent recorded, external outcome
+   * unknown," not "the external call definitely happened" — see {@link reclaimExpired}. Returns
    * whether `ownerToken` still held the lease — `false` means the lease was already reclaimed
-   * before the call could even begin; the caller must not proceed to call the channel in that case
-   * (see `Worker#execute`), since a concurrent reclaim may already be retrying this same message.
+   * before this write landed; the caller must not proceed to call the channel in that case (see
+   * `Worker#execute`), since a concurrent reclaim may already be retrying this same message.
    * @param {string} id @param {string} ownerToken @param {number} now
    */
   markCallStarted(id, ownerToken, now) {
@@ -231,8 +237,8 @@ export class Queue {
 
   /**
    * Release a claimed message back to `queued` for an immediate, free retry — no attempt cost, no
-   * backoff. Used only for a message whose external call never started (see
-   * {@link markCallStarted}); guarded the same way as every other completion write.
+   * backoff. Used only for a message that never reached {@link markCallStarted} at all (see
+   * {@link reclaimExpired}); guarded the same way as every other completion write.
    * @param {string} id @param {string} ownerToken @param {string} error @param {number} now
    * @returns {MessageRow|undefined}
    */
@@ -243,17 +249,32 @@ export class Queue {
 
   /**
    * Atomically find every message whose lock has expired (or predates leases) and, in the SAME
-   * transaction, settle each one — as a free release (see {@link markCallStarted}) if its external
-   * call never started, or as a failed attempt labeled `error` (costs an attempt, follows the
-   * normal backoff/exhaustion rule) if it did. Before Stage 6.1 every reclaim went through
-   * `markFailure` unconditionally, which meant a worker crashing repeatedly right after claim —
-   * before ever calling out to SMTP or a webhook — could exhaust `max_attempts` on infrastructure
-   * failures alone, without the message ever actually being attempted once. Running the read and
-   * every write inside one transaction is what makes this race-free against a concurrent
-   * {@link heartbeat} or {@link markCallStarted}: either commits entirely before this call (the row
-   * is no longer expired, so it's simply not selected) or is attempted entirely after (its own
-   * guarded `UPDATE` then matches zero rows, because this transaction already moved the row off
-   * `'processing'`).
+   * transaction, settle each one — as a free release if `call_started_at` is still NULL (the
+   * process never even reached the delivery-attempt boundary), or as a failed attempt labeled
+   * `error` (costs an attempt, follows the normal backoff/exhaustion rule) if it is set. Before
+   * Stage 6.1 every reclaim went through `markFailure` unconditionally, which meant a worker
+   * crashing repeatedly right after claim — before ever reaching that boundary — could exhaust
+   * `max_attempts` on infrastructure failures alone, without the message ever actually being
+   * attempted once.
+   *
+   * **What `call_started_at IS NOT NULL` does and does not prove**: it proves the process reached
+   * the line right before invoking the channel — nothing more. It does NOT prove the external
+   * SMTP send or webhook POST itself ever started (the process can still crash in the gap between
+   * that write and the `channel.deliver()` call actually running), and it certainly does not prove
+   * the external side effect completed. Counting that whole "reached the boundary, outcome
+   * unknown" bucket as a real attempt is a deliberate, conservative choice: it costs retry budget
+   * in a case that might turn out to have been a pure infra crash with nothing sent, rather than
+   * risk the opposite (a message that really was delivered, or is genuinely in flight, being
+   * retried for free indefinitely). This still makes no exactly-once claim in either direction — a
+   * message can be sent more than once (the external call actually succeeded, then the process died
+   * before the `sent` write landed) or, in the deliberately-conservative case above, retried once
+   * for a send that never actually went out.
+   *
+   * Running the read and every write inside one transaction is what makes this race-free against a
+   * concurrent {@link heartbeat} or {@link markCallStarted}: either commits entirely before this
+   * call (the row is no longer expired, so it's simply not selected) or is attempted entirely after
+   * (its own guarded `UPDATE` then matches zero rows, because this transaction already moved the
+   * row off `'processing'`).
    * @param {number} [now]
    * @param {string} [error]
    * @returns {MessageRow[]}
@@ -264,7 +285,7 @@ export class Queue {
       return stale.map((row) => {
         const ownerToken = /** @type {string} */ (row.owner_token);
         return row.call_started_at === null
-          ? /** @type {MessageRow} */ (this.#release(row.id, ownerToken, `${error} (before the external call started; not counted as an attempt)`, now))
+          ? /** @type {MessageRow} */ (this.#release(row.id, ownerToken, `${error} (never reached the delivery-attempt boundary; not counted as an attempt)`, now))
           : /** @type {MessageRow} */ (this.markFailure(row, ownerToken, error, { now }));
       });
     });

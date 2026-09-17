@@ -62,7 +62,7 @@
  * @property {number} updated_at
  * @property {number|null} sent_at
  * @property {string|null} owner_token    The fencing token of whoever currently holds the lock; null when not `processing`.
- * @property {number|null} call_started_at  ms since epoch; set right before the external call begins, null when never started or not `processing`.
+ * @property {number|null} call_started_at  ms since epoch; set right before `channel.deliver()` is invoked, null when that boundary was never reached or the row is not `processing`. NOT proof the external call itself ran — see `Queue#reclaimExpired`.
  */
 
 /**

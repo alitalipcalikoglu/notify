@@ -85,6 +85,7 @@ export class Application {
     // decoupled from call duration by the heartbeat) — is what bounds both the worker's own drain
     // wait and the process-wide force-exit timer below.
     const callCeilingMs = Math.max(EmailChannel.SMTP_WORST_CASE_MS, config.webhookTimeoutMs);
+    const { drainMs, forceExitMs } = config.shutdownTimers(callCeilingMs);
 
     if (runsWorker) {
       this.worker = new Worker({
@@ -92,7 +93,7 @@ export class Application {
         presence: this.presence,
         channels: this.channels,
         log: log.child({ component: 'worker' }),
-        options: { concurrency: config.workerConcurrency, pollMs: config.workerPollMs, retentionDays: config.retentionDays, heartbeatMs: config.heartbeatMs, drainMs: callCeilingMs + 5_000 },
+        options: { concurrency: config.workerConcurrency, pollMs: config.workerPollMs, retentionDays: config.retentionDays, heartbeatMs: config.heartbeatMs, drainMs },
       });
     }
 
@@ -126,7 +127,7 @@ export class Application {
     // bounding shutdown by LOCK_TTL_MS could force-exit while a healthy, still-heartbeating send
     // was genuinely still in flight. Bounding it by the real worst-case call duration instead
     // (same `callCeilingMs` the worker's own drain uses, plus a larger margin) fixes that.
-    const { shutdown } = Lifecycle.install({ forceExitMs: callCeilingMs + 10_000, log, steps });
+    const { shutdown } = Lifecycle.install({ forceExitMs, log, steps });
     this.shutdown = shutdown;
     this.audit.logger = log;
     this.audit.start();
