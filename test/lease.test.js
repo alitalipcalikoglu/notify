@@ -56,13 +56,16 @@ test('Worker: recover() only reclaims EXPIRED locks, not a lock still within its
   const q = testQueue(config);
   const presence = testPresence();
   const { row } = q.enqueue({ apiKeyId: 'a', channel: 'webhook', payload }, 0);
-  q.claim(1, 0);
-  const worker = new Worker({ queue: q, presence, channels: [], log: silent, options: { concurrency: 1, pollMs: 100, retentionDays: 30, heartbeatMs: 1_000 }, now: () => 0 });
+  const [claimed] = q.claim(1, 0);
+  q.markCallStarted(claimed.id, /** @type {string} */ (claimed.owner_token), 0); // simulate the send having actually started
+  const worker = new Worker({ queue: q, presence, channels: [], log: silent, options: { concurrency: 1, pollMs: 100, retentionDays: 30, heartbeatMs: 1_000, drainMs: 5_000 }, now: () => 0 });
   worker.recover();
   assert.equal(q.get(row.id, 'a')?.status, 'processing', 'lock not expired yet at now=0');
-  const workerLater = new Worker({ queue: q, presence, channels: [], log: silent, options: { concurrency: 1, pollMs: 100, retentionDays: 30, heartbeatMs: 1_000 }, now: () => 6_000 });
+  const workerLater = new Worker({ queue: q, presence, channels: [], log: silent, options: { concurrency: 1, pollMs: 100, retentionDays: 30, heartbeatMs: 1_000, drainMs: 5_000 }, now: () => 6_000 });
   workerLater.recover();
-  assert.equal(q.get(row.id, 'a')?.status, 'queued', 'now expired, recovered as a failed attempt');
+  const recovered = q.get(row.id, 'a');
+  assert.equal(recovered?.status, 'queued', 'now expired, recovered as a failed attempt');
+  assert.equal(recovered?.attempts, 1, 'the send had started (markCallStarted), so this is a real attempt');
 });
 
 test('Worker: a late-returning owner cannot overwrite a message another worker already reclaimed', async () => {
@@ -71,7 +74,8 @@ test('Worker: a late-returning owner cannot overwrite a message another worker a
   const { row } = q.enqueue({ apiKeyId: 'a', channel: 'webhook', payload }, 0);
   const [claimed] = q.claim(1, 0);
   const staleToken = /** @type {string} */ (claimed.owner_token);
-  const worker2 = new Worker({ queue: q, presence: testPresence(), channels: [], log: silent, options: { concurrency: 1, pollMs: 100, retentionDays: 30, heartbeatMs: 1_000 }, now: () => 6_000 });
+  q.markCallStarted(claimed.id, staleToken, 0); // simulate the send having actually started before the crash
+  const worker2 = new Worker({ queue: q, presence: testPresence(), channels: [], log: silent, options: { concurrency: 1, pollMs: 100, retentionDays: 30, heartbeatMs: 1_000, drainMs: 5_000 }, now: () => 6_000 });
   worker2.recover();
   assert.equal(q.get(row.id, 'a')?.status, 'queued');
   assert.equal(q.markSent(row.id, staleToken, 'late', 6_500), false, 'rejected: the stale token no longer owns this row');
@@ -91,10 +95,61 @@ test('Worker: heartbeat keeps a long in-flight send owned across the original lo
     verify: () => email.verify(),
     close: () => email.close(),
   };
-  const worker = new Worker({ queue: q, presence, channels: [/** @type {any} */ (slowEmail)], log: silent, options: { concurrency: 1, pollMs: 50, retentionDays: 30, heartbeatMs: 40 } });
+  const worker = new Worker({ queue: q, presence, channels: [/** @type {any} */ (slowEmail)], log: silent, options: { concurrency: 1, pollMs: 50, retentionDays: 30, heartbeatMs: 40, drainMs: 5_000 } });
   q.enqueue({ apiKeyId: 'a', channel: 'email', payload: { channel: 'email', template: 'generic', to: ['a@example.com'], data: { appName: 'x', subject: 's', title: 't', paragraphs: ['p'] } } });
   await worker.tick();
   const row = q.list({ apiKeyId: 'a', limit: 1 }).items[0];
   assert.equal(row.status, 'sent', row.last_error ?? 'should have succeeded, not lost the lock to its own dead heartbeat');
   assert.equal(row.attempts, 0, 'delivered on the first attempt, never reclaimed out from under the still-heartbeating worker');
+});
+
+test('Queue: batch-shared owner_token — finishing message A does not affect sibling B\'s ownership or state (Stage 6.1)', () => {
+  const config = testConfig();
+  const q = testQueue(config);
+  q.enqueue({ apiKeyId: 'a', channel: 'webhook', payload }, 0);
+  q.enqueue({ apiKeyId: 'a', channel: 'webhook', payload }, 0);
+  const [a, b] = q.claim(2, 0);
+  assert.equal(a.owner_token, b.owner_token, 'same batch, same token');
+  assert.equal(q.markSent(a.id, /** @type {string} */ (a.owner_token), 'ok-a', 10), true);
+  // B is untouched: still processing, its heartbeat/finish still work with the SAME shared token.
+  const stillB = q.get(b.id, 'a');
+  assert.equal(stillB?.status, 'processing');
+  assert.equal(stillB?.owner_token, b.owner_token);
+  assert.equal(q.heartbeat(b.id, /** @type {string} */ (b.owner_token), 20, 30_000), true, 'B still heartbeats fine after A finished');
+  assert.equal(q.markSent(b.id, /** @type {string} */ (b.owner_token), 'ok-b', 30), true);
+  assert.equal(q.get(a.id, 'a')?.provider_id, 'ok-a', 'A unaffected by B finishing afterwards');
+  assert.equal(q.get(b.id, 'a')?.provider_id, 'ok-b');
+});
+
+test('Worker: stop() is bounded by drainMs even if an in-flight send never resolves (Stage 6.1)', async () => {
+  const config = testConfig();
+  const q = testQueue(config);
+  const presence = testPresence();
+  /** @type {(v?: unknown) => void} */
+  let neverResolve = () => {};
+  const stuckChannel = {
+    name: 'webhook',
+    deliver: () => new Promise((resolve) => { neverResolve = resolve; }),
+    isRetryable: () => true,
+    verify: async () => {},
+    close: () => {},
+  };
+  /** @type {[object, string][]} */
+  const errors = [];
+  const log = /** @type {any} */ ({
+    info() {}, warn() {}, debug() {}, fatal() {}, child() { return this; },
+    error(/** @type {object} */ obj, /** @type {string} */ msg) { errors.push([obj, msg]); },
+  });
+  const worker = new Worker({ queue: q, presence, channels: [/** @type {any} */ (stuckChannel)], log, options: { concurrency: 1, pollMs: 20, retentionDays: 30, heartbeatMs: 1_000, drainMs: 100 } });
+  q.enqueue({ apiKeyId: 'a', channel: 'webhook', payload });
+  worker.start();
+  const deadline = Date.now() + 2_000;
+  while (q.stats().processing === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+  const startedStop = Date.now();
+  await worker.stop();
+  const elapsed = Date.now() - startedStop;
+  assert.ok(elapsed < 1_000, `stop() must not hang forever; took ${elapsed}ms with drainMs=100`);
+  assert.equal(errors.length, 1, 'logs exactly the drain-timeout error');
+  assert.match(errors[0][1], /drain timed out/);
+  neverResolve(); // let the abandoned promise settle so it doesn't leak into later tests
 });

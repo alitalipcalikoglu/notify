@@ -42,7 +42,7 @@ function setup(overrides = {}, { allowPrivate = true, emailFail } = {}) {
   const webhook = testWebhookChannel(config, { allowPrivate });
   const worker = new Worker({
     queue, presence, channels: [email, webhook], log: silentLog,
-    options: { concurrency: config.workerConcurrency, pollMs: config.workerPollMs, retentionDays: config.retentionDays, heartbeatMs: config.heartbeatMs },
+    options: { concurrency: config.workerConcurrency, pollMs: config.workerPollMs, retentionDays: config.retentionDays, heartbeatMs: config.heartbeatMs, drainMs: 5_000 },
   });
   return { config, queue, presence, worker, sent };
 }
@@ -150,17 +150,19 @@ test('webhook to a private or disallowed host fails permanently without connecti
 });
 
 test('start/stop loop drains the queue and recovers stale processing rows', async () => {
-  // Stage 6: recovering a stale lock now costs an attempt and schedules the normal backoff delay
-  // (previously a free, immediate re-queue) — a tiny BACKOFF_BASE_MS keeps this test fast.
-  const { queue, worker } = setup({ BACKOFF_BASE_MS: '100' });
+  const { queue, worker } = setup();
   const stale = queue.enqueue({ apiKeyId: 'a', channel: 'webhook', payload: webhookPayload('/ok') }, 0).row;
-  queue.claim(1, 0); // simulate a crash mid-delivery long ago
+  queue.claim(1, 0); // simulate a crash long ago, BEFORE the external call ever started
   assert.equal(queue.get(stale.id, 'a')?.status, 'processing');
   worker.start();
   const deadline = Date.now() + 2000;
   while (queue.get(stale.id, 'a')?.status !== 'sent' && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
   await worker.stop();
-  assert.equal(queue.get(stale.id, 'a')?.status, 'sent');
+  const row = queue.get(stale.id, 'a');
+  assert.equal(row?.status, 'sent');
+  // Stage 6.1: the call never started before the crash, so recovery released it for free — the
+  // eventual successful send is still attempt 0 in the sense that no failed attempt was recorded.
+  assert.equal(row?.attempts, 0, 'the crash-before-send recovery did not cost an attempt');
 });
 
 test('Worker: a rolling pool refills a freed slot instead of waiting for the whole batch (Stage 6 fix)', async (t) => {

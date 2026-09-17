@@ -21,7 +21,7 @@ pm2 save && pm2 startup        # survive reboots
 pm2 reload notify              # restart after a deploy: waits for the app's ready signal
 ```
 
-`kill_timeout` is 60 s so in-flight deliveries finish before PM2 escalates to SIGKILL. Keep `instances: 1`: the delivery worker runs in-process and one SQLite file expects one writer.
+`kill_timeout` is 150 s so in-flight deliveries finish before PM2 escalates to SIGKILL. Keep `instances: 1`: the delivery worker runs in-process and one SQLite file expects one writer.
 
 Production with Docker:
 

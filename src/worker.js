@@ -30,7 +30,7 @@ export class Worker {
    * @param {HeartbeatStore} deps.presence
    * @param {AnyChannel[]} deps.channels
    * @param {MinimalLogger} deps.log
-   * @param {{ concurrency: number, pollMs: number, retentionDays: number, heartbeatMs: number }} deps.options
+   * @param {{ concurrency: number, pollMs: number, retentionDays: number, heartbeatMs: number, drainMs: number }} deps.options
    * @param {() => number} [deps.now]
    */
   constructor({ queue, presence, channels, log, options, now = Date.now }) {
@@ -67,14 +67,34 @@ export class Worker {
     this.claiming = false;
   }
 
-  /** Stop claiming (if not already) and wait for in-flight sends to finish. */
+  /**
+   * Stop claiming (if not already) and wait for in-flight sends to finish, bounded by
+   * `options.drainMs` (Stage 6.1) — under ordinary operation every in-flight send already has its
+   * own real timeout (SMTP's hardcoded socket timeouts, `WEBHOOK_TIMEOUT_MS`), so the drain
+   * finishes well within `drainMs`. If it doesn't (a call somehow bypassed its own timeout), this
+   * stops waiting and logs loudly rather than hanging the whole shutdown sequence forever — the
+   * abandoned send(s) may still complete in the background and their eventual `markSent`/
+   * `markFailure` write can fail against an already-closed DB after this point; that is the
+   * accepted cost of never blocking shutdown indefinitely, not a silent one (logged, not thrown).
+   */
   async stop() {
     if (!this.running) return;
     this.running = false;
     this.claiming = false;
     this.abort.abort();
     await this.loop;
-    await Promise.allSettled(this.inFlight);
+    // The losing side of this race must be cancelled explicitly: node:timers/promises' sleep()
+    // otherwise keeps its timer alive for the full drainMs even after the race already settled via
+    // in-flight draining first — harmless in production (process.exit() doesn't wait on pending
+    // timers) but it visibly hangs anything that inspects the event loop (tests included) for up to
+    // drainMs. The abort rejection is caught, not left to become an unhandled rejection.
+    const drainAbort = new AbortController();
+    const outcome = await Promise.race([
+      Promise.allSettled(this.inFlight).then(() => /** @type {const} */ ('drained')),
+      sleep(this.options.drainMs, undefined, { signal: drainAbort.signal }).then(() => /** @type {const} */ ('timed-out')).catch(() => /** @type {const} */ ('timed-out')),
+    ]);
+    drainAbort.abort();
+    if (outcome === 'timed-out') this.log.error({ inFlight: this.inFlight.size, drainMs: this.options.drainMs }, 'drain timed out; continuing shutdown with sends still in flight');
     this.loop = null;
     this.log.info('worker stopped');
   }
@@ -139,6 +159,15 @@ export class Worker {
     const channel = this.channels.get(row.channel);
     try {
       if (!channel) throw Object.assign(new Error(`no channel registered for "${row.channel}"`), { retryable: false });
+      // Stage 6.1: the line between "claimed" and "attempted" — see Queue#reclaimExpired. If the
+      // lease is already gone by this point (extremely rare: reclaimed between claim and here),
+      // don't start the external call at all — a concurrent reclaim may already be retrying this
+      // same message, and starting our own send too would risk a genuinely duplicate delivery for
+      // no benefit, since our own result could never be recorded anyway.
+      if (!this.queue.markCallStarted(row.id, ownerToken, this.now())) {
+        this.log.warn(meta, 'lock lost before the external call could start; not sending, another worker already reclaimed it');
+        return;
+      }
       const providerId = await channel.deliver(row.id, JSON.parse(row.payload));
       const ok = this.queue.markSent(row.id, ownerToken, providerId, this.now());
       if (!ok) { this.log.warn(meta, 'lock lost before this delivery could be recorded; result discarded, another worker already reclaimed it'); return; }

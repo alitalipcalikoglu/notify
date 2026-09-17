@@ -44,5 +44,13 @@ export class Database extends CoreDatabase {
       seen_at  INTEGER NOT NULL
     );
     `,
+    `
+    -- Stage 6.1: distinguishes "claimed but the external call never started" (an infra-only crash —
+    -- release for a free retry, no attempt cost) from "the external call started, outcome unknown"
+    -- (a real attempt — reclaim costs one, same as any other failure). NULL means never started;
+    -- set once, right before the channel's deliver() call, cleared on every write that leaves
+    -- 'processing' (finish or release).
+    ALTER TABLE messages ADD COLUMN call_started_at INTEGER;
+    `,
   ];
 }

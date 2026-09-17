@@ -81,13 +81,18 @@ export class Application {
     /** @type {import('./types.js').MinimalLogger} */
     let log = new ConsoleLogger({ level: /** @type {any} */ (config.logLevel) });
 
+    // Stage 6.1: the worst-case duration of one real call — not LOCK_TTL_MS (the lease TTL, now
+    // decoupled from call duration by the heartbeat) — is what bounds both the worker's own drain
+    // wait and the process-wide force-exit timer below.
+    const callCeilingMs = Math.max(EmailChannel.SMTP_WORST_CASE_MS, config.webhookTimeoutMs);
+
     if (runsWorker) {
       this.worker = new Worker({
         queue: this.queue,
         presence: this.presence,
         channels: this.channels,
         log: log.child({ component: 'worker' }),
-        options: { concurrency: config.workerConcurrency, pollMs: config.workerPollMs, retentionDays: config.retentionDays, heartbeatMs: config.heartbeatMs },
+        options: { concurrency: config.workerConcurrency, pollMs: config.workerPollMs, retentionDays: config.retentionDays, heartbeatMs: config.heartbeatMs, drainMs: callCeilingMs + 5_000 },
       });
     }
 
@@ -106,8 +111,9 @@ export class Application {
     // drain whatever the worker already had in flight, THEN close the channels (only meaningful
     // once nothing is still sending through them), THEN flush audit, THEN close the DB. Audit
     // used to flush before the worker drained — see `scheduler`'s `application.js` for the full
-    // reasoning (identical fix, same bug class). `worker.stop()`'s own bounded wait is
-    // `forceExitMs` below — no separate per-step drain timeout.
+    // reasoning (identical fix, same bug class). `worker.stop()` now has its own bounded drain
+    // wait (`drainMs` above, Stage 6.1) strictly shorter than `forceExitMs` below, so a stuck drain
+    // logs and moves on to the remaining steps before the whole process gets force-killed.
     if (this.worker) steps.push(() => /** @type {Worker} */ (this.worker).stopClaiming());
     if (this.app) steps.push(() => this.app?.close());
     if (this.worker) steps.push(() => /** @type {Worker} */ (this.worker).stop());
@@ -115,7 +121,12 @@ export class Application {
     steps.push(() => this.audit.close());
     steps.push(() => this.db.close());
 
-    const { shutdown } = Lifecycle.install({ forceExitMs: config.lockTtlMs + 10_000, log, steps });
+    // Stage 6.1 fix: previously `config.lockTtlMs + 10_000` — the lease TTL, not the call
+    // duration. With the heartbeat, a legitimate call can run far longer than LOCK_TTL_MS, so
+    // bounding shutdown by LOCK_TTL_MS could force-exit while a healthy, still-heartbeating send
+    // was genuinely still in flight. Bounding it by the real worst-case call duration instead
+    // (same `callCeilingMs` the worker's own drain uses, plus a larger margin) fixes that.
+    const { shutdown } = Lifecycle.install({ forceExitMs: callCeilingMs + 10_000, log, steps });
     this.shutdown = shutdown;
     this.audit.logger = log;
     this.audit.start();

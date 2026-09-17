@@ -101,7 +101,10 @@ why):
    lifecycle. Present only in the API and combined roles.
 3. `await this.worker?.stop()` — (redundant `running = false`) awaits the worker's in-flight loop
    promise and every in-flight send (`Promise.allSettled(this.inFlight)`), clearing each one's
-   heartbeat interval as it settles.
+   heartbeat interval as it settles. Stage 6.1: this wait is itself bounded by `options.drainMs` —
+   races `Promise.allSettled(inFlight)` against a `sleep(drainMs)`, cancelled via `AbortController`
+   so the loser doesn't leak a timer. On timeout it logs `'drain timed out; continuing shutdown
+   with sends still in flight'` and falls through to the remaining steps instead of hanging.
 4. `for (const ch of this.channels) ch.close()` — `EmailChannel` closes its pooled SMTP
    connections; `WebhookChannel` has no `close()` override, so it's a no-op.
 5. `await this.audit.close()` — stops the flush timer and performs one final `flush()`, using the
@@ -113,20 +116,37 @@ why):
 needing to record an audit event could queue it into an already-flushed, already-stopped buffer).
 
 On success: `process.exit(0)`. Force-exit timeout: a `setTimeout(...).unref()` set to
-**`this.config.lockTtlMs + 10_000`** (Stage 6 added the `+10_000` margin, matching
-`scheduler`/`webhook-out`'s identical pattern — previously exactly `lockTtlMs` with no margin) —
-default `120_000 + 10_000 = 130_000` ms. `LOCK_TTL_MS` is now bounded (`config.js`, `max: 600_000`;
-previously unbounded) for the same reason `scheduler`'s `MAX_TIMEOUT_MS` is bounded: so
-`ecosystem.config.cjs`'s static `kill_timeout` can be derived once and stay valid for every value
-config validation allows.
+`callCeilingMs + 10_000`, where `callCeilingMs = Math.max(EmailChannel.SMTP_WORST_CASE_MS,
+config.webhookTimeoutMs)` — default `Math.max(50_000, 10_000) + 10_000 = 60_000` ms. The worker's
+own `drainMs` (previous step) uses the same `callCeilingMs`, plus a smaller margin:
+`callCeilingMs + 5_000` — default `55_000` ms — so the drain timeout always fires first and the
+remaining shutdown steps (channel close, audit flush, DB close) get a chance to run before the
+force-exit timer hard-kills the process.
 
-Comparison with PM2: `ecosystem.config.cjs` now sets `kill_timeout: 630000` (630 s; was a static
-`60000` that the app's own 120 s default force-exit timer already exceeded — a real, previously
-documented mismatch). `630_000 = 600_000 (LOCK_TTL_MS max) + 10_000 (force-exit margin) + 20_000`
-(drain/flush/close headroom on top of the force-exit timer itself) — comfortably above the worst
-case the force-exit timer can now reach (`610_000` ms) regardless of how `LOCK_TTL_MS` is
-configured within its validated range. This closes the mismatch the previous revision of this
-document described under "Known failure modes".
+**Stage 6.1 fix**: before this stage, `forceExitMs` was `config.lockTtlMs + 10_000` — the lease
+TTL, not the call duration. That was sound before the heartbeat existed (a send could never
+outlive its own lease), but the heartbeat decouples the two: a legitimate SMTP/webhook call can now
+run far longer than `LOCK_TTL_MS` as long as it keeps renewing the lease, so bounding shutdown by
+`LOCK_TTL_MS` risked force-exiting mid-call on a perfectly healthy, still-heartbeating send.
+`EmailChannel.SMTP_WORST_CASE_MS` (`connectionTimeout + greetingTimeout + socketTimeout` from
+`createTransport`, `= 50_000`) and `config.webhookTimeoutMs` are the real ceilings on how long one
+external call can legitimately take, so `callCeilingMs` replaces `lockTtlMs` as the basis for both
+`drainMs` and `forceExitMs`.
+
+Comparison with PM2: `notify/ecosystem.config.cjs` sets `kill_timeout: 150000` (150 s; was `630000`,
+sized for the old `lockTtlMs`-based formula and left comfortably oversized once `forceExitMs`
+dropped to a call-duration basis). `150_000 = max(SMTP_WORST_CASE_MS=50_000,
+WEBHOOK_TIMEOUT_MS max 120_000) + 10_000 (force-exit margin) = 130_000`, plus `20_000` headroom —
+comfortably above the worst-case force-exit timer regardless of how `WEBHOOK_TIMEOUT_MS` is
+configured within its validated range.
+
+The five numbers that matter for notify's shutdown, in the same relationship as `scheduler` and
+`webhook-out`: worker drain timeout (`drainMs = callCeilingMs + 5_000`); the external call's own
+timeout ceiling (`callCeilingMs`, the larger of the SMTP worst case and `WEBHOOK_TIMEOUT_MS`); the
+heartbeat interval (`HEARTBEAT_MS`) that renews a lease during an in-flight call; the lease TTL
+(`LOCK_TTL_MS`), now fully decoupled from call duration by the heartbeat; and PM2's `kill_timeout`
+(150 s), which sits above the app's own force-exit timer so PM2 never SIGKILLs before the app has a
+chance to exit on its own.
 
 ## Resource limits
 - `BODY_LIMIT` (default `65536` bytes): Fastify `bodyLimit`, enforced on every request — confirmed
@@ -316,18 +336,41 @@ is in flight. `Queue#markSent`/`Queue#markFailure` are guarded by `WHERE id = ? 
 AND status = 'processing'`, so a worker that hung long enough to be reclaimed by someone else can
 never overwrite the row when it eventually returns. `Queue#reclaimExpired` (called by
 `Worker#recover()` at startup, labeled `"interrupted by restart"`, and by the in-loop
-`#reclaimStale()` on every poll pass, labeled `"lease expired"`) reads every row whose lock has
-expired and settles each one as a failed attempt — through the SAME `markFailure` path an ordinary
-send failure uses, so it costs an attempt and follows the normal backoff/exhaustion schedule —
-inside one transaction with every write, the same race-free construction as `scheduler`'s identical
-primitive (see its README for the full "why one transaction" reasoning).
+`#reclaimStale()` on every poll pass, labeled `"lease expired"`) reads every row whose lock is
+strictly expired — `locked_until < now`, so `now == locked_until` is NOT yet expired, the same
+invariant as claim/heartbeat/finish (Stage 6.1 regression test: `test/queue.test.js`'s
+`reclaimExpired` boundary assertions) — inside one transaction with every write, the same
+race-free construction as `scheduler`'s identical primitive (see its README for the full "why one
+transaction" reasoning). What it does with each expired row now depends on `call_started_at`
+(Stage 6.1, `messages.call_started_at`, set by `Worker#deliver()` right before the channel's
+`deliver()` call, cleared on every write leaving `'processing'`):
+- **`call_started_at IS NULL`** — the external SMTP/webhook call never started; this was an
+  infra-only crash between claim and send (process killed, container rescheduled, etc.) with the
+  message never actually attempted. Released back to `'queued'` for free — `next_attempt_at = now`
+  (immediately due again, no backoff) and **no attempt cost** — via the same fencing-guarded
+  release path `#release()` uses internally.
+- **`call_started_at` is set** — the external call started and its outcome is unknown (the process
+  died, or is merely unreachable, sometime between the call starting and a `sent`/`failed` write
+  landing). Settled as a failed attempt through the same `markFailure` path an ordinary send
+  failure uses — it costs an attempt and follows the normal backoff/exhaustion schedule, exactly as
+  before Stage 6.1.
 
 **What changed from before Stage 6**: `reapStale()` reset every expired-lock row straight back to
 `queued` for free, with no attempt cost and no fencing check on the row it touched (there was no
 `owner_token` at all). A worker that crashed repeatedly on the same message could have it reaped
 and reclaimed indefinitely without `max_attempts` ever being enforced against that path — only
 against genuine send failures. `reclaimExpired` closes that gap by routing reclaim through the same
-attempt-counting path as any other failure.
+attempt-counting path as any other failure — **unconditionally**, at the time.
+
+**What changed again in Stage 6.1**: routing every reclaim through `markFailure` unconditionally was
+itself a real gap in the other direction — a process that crashes repeatedly right after claiming a
+message, before ever calling out to SMTP/the webhook target, could exhaust `max_attempts` on pure
+infrastructure churn with the message never actually sent once. `call_started_at` draws the exact
+line: "claimed" alone costs nothing; "the external call started" is what counts as a real attempt.
+This still does not claim exactly-once delivery — if the external call actually succeeded but the
+process died before the `sent` write landed, `call_started_at` was already set, so the reclaim
+counts it as a failed attempt and a duplicate send is still possible on retry. Stage 6.1 only
+guarantees retry budget is never consumed by a crash that never reached the external side effect.
 
 ## Scaling model
 **B — single-node stateful, but "single-node" now means one HOST, not one PROCESS.** One SQLite

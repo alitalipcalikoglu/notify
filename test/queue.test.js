@@ -98,26 +98,43 @@ test('markFailure re-queues with backoff, fails after max attempts or when final
   assert.equal(q.retry(retried.id, 'a', 10), undefined, 'only failed rows can be retried');
 });
 
-test('reclaimExpired settles expired locks as a failed attempt (Stage 6: costs an attempt, not a free reset); purge removes old finished rows', () => {
+test('reclaimExpired: the external call having started decides free release vs. a real failed attempt (Stage 6.1)', () => {
   const q = testQueue(config);
-  const { row } = q.enqueue({ apiKeyId: 'a', channel: 'webhook', payload }, 0);
-  const [claimed] = q.claim(1, 0);
-  assert.deepEqual(q.reclaimExpired(config.lockTtlMs - 1), [], 'lock not expired yet');
-  const reclaimed = q.reclaimExpired(config.lockTtlMs + 1);
-  assert.equal(reclaimed.length, 1);
-  assert.equal(reclaimed[0].status, 'queued', 'first failed attempt: back to queued with backoff, not exhausted');
-  assert.equal(reclaimed[0].attempts, 1, 'unlike the pre-Stage-6 free reap, this cost an attempt');
-  assert.equal(reclaimed[0].last_error, 'lease expired');
-  assert.equal(q.get(row.id, 'a')?.status, 'queued');
-  // The original claim's owner_token no longer owns the row after reclaim — a late finish() from
-  // that same claim must not overwrite the reclaimed outcome.
-  assert.equal(q.markSent(row.id, /** @type {string} */ (claimed.owner_token), 'late', config.lockTtlMs + 2), false);
+
+  // Crash BEFORE the external call started: infra-only crash, free retry, no attempt cost.
+  const { row: neverStarted } = q.enqueue({ apiKeyId: 'a', channel: 'webhook', payload }, 0);
+  const [claimedA] = q.claim(1, 0);
+  assert.equal(claimedA.call_started_at, null);
+  assert.deepEqual(q.reclaimExpired(config.lockTtlMs), [], 'exact boundary: lock_until == now is NOT yet expired');
+  const releasedA = q.reclaimExpired(config.lockTtlMs + 1);
+  assert.equal(releasedA.length, 1);
+  assert.equal(releasedA[0].status, 'queued');
+  assert.equal(releasedA[0].attempts, 0, 'never attempted: no attempt cost');
+  assert.match(String(releasedA[0].last_error), /before the external call started/);
+  assert.equal(releasedA[0].next_attempt_at, config.lockTtlMs + 1, 'immediately due again, no backoff');
+  // The original claim's owner_token no longer owns the row after release — a late finish() must
+  // not overwrite the release outcome.
+  assert.equal(q.markSent(neverStarted.id, /** @type {string} */ (claimedA.owner_token), 'late', config.lockTtlMs + 2), false);
+
+  // Crash AFTER the external call started (outcome unknown): a real attempt, costs the budget,
+  // follows the normal backoff schedule — same as any other failure.
+  const { row: started } = q.enqueue({ apiKeyId: 'a', channel: 'webhook', payload }, 100_000);
+  const [claimedB] = q.claim(1, 100_000);
+  assert.equal(q.markCallStarted(claimedB.id, /** @type {string} */ (claimedB.owner_token), 100_000), true);
+  assert.deepEqual(q.reclaimExpired(100_000 + config.lockTtlMs), [], 'exact boundary: still not expired');
+  const reclaimedB = q.reclaimExpired(100_000 + config.lockTtlMs + 1);
+  assert.equal(reclaimedB.length, 1);
+  assert.equal(reclaimedB[0].status, 'queued', 'first failed attempt: back to queued with backoff, not exhausted');
+  assert.equal(reclaimedB[0].attempts, 1, 'the call had started: this costs an attempt, unlike the never-started case above');
+  assert.equal(reclaimedB[0].last_error, 'lease expired');
+  assert.equal(q.get(started.id, 'a')?.status, 'queued');
+  assert.equal(q.markSent(started.id, /** @type {string} */ (claimedB.owner_token), 'late', 100_000 + config.lockTtlMs + 2), false, 'late finish() from the reclaimed claim is rejected');
 
   const [c] = q.claim(1, 200_000);
   q.markSent(c.id, /** @type {string} */ (c.owner_token), null, 200_000);
   assert.equal(q.purge(200_000), 0, 'not strictly older');
   assert.equal(q.purge(200_001), 1);
-  assert.equal(q.get(row.id, 'a'), undefined);
+  assert.equal(q.get(neverStarted.id, 'a'), undefined);
 });
 
 test('list paginates newest first with an opaque cursor and filters by status', () => {

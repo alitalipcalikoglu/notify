@@ -80,7 +80,8 @@ class Cursor {
  */
 export class Queue {
   static COLUMNS = `id, api_key_id, idempotency_key, channel, payload, status, attempts, max_attempts,
-    next_attempt_at, locked_until, last_error, provider_id, created_at, updated_at, sent_at, owner_token`;
+    next_attempt_at, locked_until, last_error, provider_id, created_at, updated_at, sent_at, owner_token,
+    call_started_at`;
 
   /**
    * @param {Database} db
@@ -117,7 +118,13 @@ export class Queue {
         WHERE id = ? AND status = 'processing' AND owner_token = ?
         RETURNING ${C}`),
       heartbeat: db.prepare(`UPDATE messages SET locked_until = ? WHERE id = ? AND owner_token = ? AND status = 'processing'`),
+      callStarted: db.prepare(`UPDATE messages SET call_started_at = ? WHERE id = ? AND owner_token = ? AND status = 'processing'`),
       expiredLocks: db.prepare(`SELECT ${C} FROM messages WHERE status = 'processing' AND (locked_until IS NULL OR locked_until < ?)`),
+      release: db.prepare(`
+        UPDATE messages SET status = 'queued', next_attempt_at = ?, locked_until = NULL, owner_token = NULL,
+          call_started_at = NULL, last_error = ?, updated_at = ?
+        WHERE id = ? AND status = 'processing' AND owner_token = ?
+        RETURNING ${C}`),
       processingCount: db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE status = 'processing'`),
       purge: db.prepare(`DELETE FROM messages WHERE status IN ('sent', 'failed') AND updated_at < ?`),
       retry: db.prepare(`
@@ -209,11 +216,41 @@ export class Queue {
   }
 
   /**
+   * Mark that the external call (SMTP send / webhook POST) is actually about to start — the line
+   * between "claimed" and "attempted." Stage 6.1: this is what lets {@link reclaimExpired} tell an
+   * infra-only crash (worker died between claim and this call, message never actually attempted)
+   * from a real failed attempt (the external call started; its outcome is unknown). Returns
+   * whether `ownerToken` still held the lease — `false` means the lease was already reclaimed
+   * before the call could even begin; the caller must not proceed to call the channel in that case
+   * (see `Worker#execute`), since a concurrent reclaim may already be retrying this same message.
+   * @param {string} id @param {string} ownerToken @param {number} now
+   */
+  markCallStarted(id, ownerToken, now) {
+    return Number(this.stmt.callStarted.run(now, id, ownerToken).changes) > 0;
+  }
+
+  /**
+   * Release a claimed message back to `queued` for an immediate, free retry — no attempt cost, no
+   * backoff. Used only for a message whose external call never started (see
+   * {@link markCallStarted}); guarded the same way as every other completion write.
+   * @param {string} id @param {string} ownerToken @param {string} error @param {number} now
+   * @returns {MessageRow|undefined}
+   */
+  #release(id, ownerToken, error, now) {
+    const rows = /** @type {MessageRow[]} */ (this.stmt.release.all(now, error.slice(0, 2000), now, id, ownerToken));
+    return rows[0];
+  }
+
+  /**
    * Atomically find every message whose lock has expired (or predates leases) and, in the SAME
-   * transaction, record each one as a failed attempt labeled `error` (costs an attempt, follows
-   * the normal backoff/exhaustion rule — unlike the pre-Stage-6 reap, which reset the row for
-   * free). Running the read and every write inside one transaction is what makes this race-free
-   * against a concurrent {@link heartbeat}: it either commits entirely before this call (the row
+   * transaction, settle each one — as a free release (see {@link markCallStarted}) if its external
+   * call never started, or as a failed attempt labeled `error` (costs an attempt, follows the
+   * normal backoff/exhaustion rule) if it did. Before Stage 6.1 every reclaim went through
+   * `markFailure` unconditionally, which meant a worker crashing repeatedly right after claim —
+   * before ever calling out to SMTP or a webhook — could exhaust `max_attempts` on infrastructure
+   * failures alone, without the message ever actually being attempted once. Running the read and
+   * every write inside one transaction is what makes this race-free against a concurrent
+   * {@link heartbeat} or {@link markCallStarted}: either commits entirely before this call (the row
    * is no longer expired, so it's simply not selected) or is attempted entirely after (its own
    * guarded `UPDATE` then matches zero rows, because this transaction already moved the row off
    * `'processing'`).
@@ -224,7 +261,12 @@ export class Queue {
   reclaimExpired(now = Date.now(), error = 'lease expired') {
     return this.db.transaction(() => {
       const stale = /** @type {MessageRow[]} */ (this.stmt.expiredLocks.all(now));
-      return stale.map((row) => /** @type {MessageRow} */ (this.markFailure(row, /** @type {string} */ (row.owner_token), error, { now })));
+      return stale.map((row) => {
+        const ownerToken = /** @type {string} */ (row.owner_token);
+        return row.call_started_at === null
+          ? /** @type {MessageRow} */ (this.#release(row.id, ownerToken, `${error} (before the external call started; not counted as an attempt)`, now))
+          : /** @type {MessageRow} */ (this.markFailure(row, ownerToken, error, { now }));
+      });
     });
   }
 

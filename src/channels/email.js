@@ -11,6 +11,15 @@ import { Channel } from './channel.js';
  */
 export class EmailChannel extends Channel {
   /**
+   * Worst-case duration of one real-SMTP send attempt: `connectionTimeout` + `greetingTimeout` +
+   * `socketTimeout` from {@link createTransport}, all hardcoded there. Stage 6.1: used by
+   * `Application` to size the shutdown force-exit timer and the worker's own drain bound — these
+   * must be based on the worst-case call duration, not on `LOCK_TTL_MS` (the lease TTL), since the
+   * heartbeat decouples how long a call may legitimately run from how long its lease lasts without
+   * one.
+   */
+  static SMTP_WORST_CASE_MS = 10_000 + 10_000 + 30_000;
+  /**
    * @param {object} opts
    * @param {TemplateRegistry} opts.templates
    * @param {string} opts.from             Default From header.
