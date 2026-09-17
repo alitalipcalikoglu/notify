@@ -20,6 +20,7 @@
  * @property {{ url: string, apiKey: string }|null} audit   Audit service to forward events to; null = off.  Serve HTTPS directly when set.
  * @property {number} bodyLimit
  * @property {string} dbPath
+ * @property {string} [dbBackupDir]
  * @property {ApiKey[]} apiKeys
  * @property {string} smtpUrl              nodemailer connection URL, or "json:" for the dev transport.
  * @property {string} smtpFrom             Default From header.

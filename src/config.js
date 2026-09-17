@@ -21,6 +21,7 @@ export class Config {
     this.audit = values.audit;
     this.bodyLimit = values.bodyLimit;
     this.dbPath = values.dbPath;
+    this.dbBackupDir = values.dbBackupDir;
     this.apiKeys = values.apiKeys;
     this.smtpUrl = values.smtpUrl;
     this.smtpFrom = values.smtpFrom;
@@ -76,6 +77,7 @@ export class Config {
       audit: parseAudit(r),
       bodyLimit: r.integer('BODY_LIMIT', 65_536, { min: 1_024 }),
       dbPath: r.optional('DB_PATH') || './data/notify.db',
+      dbBackupDir: r.optional('DB_BACKUP_DIR') || undefined,
       apiKeys: Config.#parseApiKeys(r.required('NOTIFY_API_KEYS')),
       smtpUrl,
       smtpFrom,
