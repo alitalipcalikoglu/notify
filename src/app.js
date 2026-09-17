@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
-import { AuditClient } from './net/audit-client.js';
+import { AuditClient } from '@atc-web/service-core/audit';
+import { registerProbes } from '@atc-web/service-core/fastify';
 import { ApiKeyAuth } from './auth.js';
 import { InvalidCursorError } from './queue.js';
 
@@ -150,7 +151,7 @@ export class NotifyApi {
    * @param {TemplateRegistry} deps.templates
    * @param {AnyChannel[]} deps.channels   Probed by `/ready`.
    * @param {import('./types.js').Logger} [deps.logger]
-   * @param {import('./net/audit-client.js').AuditClient} [deps.audit]
+   * @param {import('@atc-web/service-core/audit').AuditClient} [deps.audit]
    */
   constructor({ config, audit, queue, templates, channels, logger }) {
     this.config = config;
@@ -162,7 +163,6 @@ export class NotifyApi {
     this.auth = new ApiKeyAuth(config.apiKeys);
     /** @type {Map<string, DataValidator>} */
     this.dataValidators = new Map();
-    this.readyCache = { at: 0, ok: false, error: '' };
   }
 
   /** @returns {Promise<import('fastify').FastifyInstance>} */
@@ -184,7 +184,10 @@ export class NotifyApi {
     app.setNotFoundHandler((_request, reply) => {
       reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'route not found' } });
     });
-    this.#registerProbes(app);
+    registerProbes(app, async () => {
+      this.queue.db.ping();
+      for (const ch of this.channels) await ch.verify();
+    }, { cacheMs: NotifyApi.READY_CACHE_MS });
     await app.register((api) => this.#registerV1(api), { prefix: '/v1' });
     await app.register((ops) => this.#registerMetrics(ops));
     return app;
@@ -212,34 +215,6 @@ export class NotifyApi {
     }
     return reply.code(status).send({ error: { code: err.code ?? 'REQUEST_ERROR', message: err.message } });
   };
-
-  /** @param {import('fastify').FastifyInstance} app */
-  #registerProbes(app) {
-    app.get('/health', { logLevel: 'warn' }, async () => ({ status: 'ok' }));
-    app.get('/ready', { logLevel: 'warn' }, async (_request, reply) => {
-      const ready = await this.#readiness();
-      if (!ready.ok) {
-        app.log.warn({ error: ready.error }, 'readiness check failed');
-        return reply.code(503).send({ status: 'unavailable', error: ready.error });
-      }
-      return { status: 'ok' };
-    });
-  }
-
-  /** Database and every channel backend reachable; result cached to keep probes cheap. */
-  async #readiness() {
-    const now = Date.now();
-    if (now - this.readyCache.at > NotifyApi.READY_CACHE_MS) {
-      try {
-        this.queue.db.ping();
-        for (const ch of this.channels) await ch.verify();
-        this.readyCache = { at: now, ok: true, error: '' };
-      } catch (err) {
-        this.readyCache = { at: now, ok: false, error: err instanceof Error ? err.message : String(err) };
-      }
-    }
-    return this.readyCache;
-  }
 
   /** @param {import('fastify').FastifyInstance} api */
   async #registerV1(api) {

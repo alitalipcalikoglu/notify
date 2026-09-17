@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AuditClient } from '../src/net/audit-client.js';
+import { AuditClient } from '@atc-web/service-core/audit';
 
 const silent = { warn() {}, error() {} };
 

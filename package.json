@@ -20,6 +20,7 @@
     "typecheck": "tsc -p jsconfig.json"
   },
   "dependencies": {
+    "@atc-web/service-core": "github:alitalipcalikoglu/service-core#v1.3.1",
     "@fastify/rate-limit": "11.2.0",
     "fastify": "5.12.4",
     "nodemailer": "10.0.10"

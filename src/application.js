@@ -1,5 +1,6 @@
 import { NotifyApi } from './app.js';
-import { AuditClient } from './net/audit-client.js';
+import { AuditClient } from '@atc-web/service-core/audit';
+import { Lifecycle } from '@atc-web/service-core/lifecycle';
 import { EmailChannel } from './channels/email.js';
 import { WebhookChannel, WebhookSigner } from './channels/webhook.js';
 import { Config } from './config.js';
@@ -38,7 +39,8 @@ export class Application {
     this.app = null;
     /** @type {Worker|null} */
     this.worker = null;
-    this.shuttingDown = false;
+    /** @type {(reason: string) => Promise<void>} */
+    this.shutdown = async () => {};
   }
 
   /** Build from `process.env`; exits the process with a readable message on bad configuration. */
@@ -63,54 +65,25 @@ export class Application {
       log: app.log.child({ component: 'worker' }),
       options: { concurrency: this.config.workerConcurrency, pollMs: this.config.workerPollMs, retentionDays: this.config.retentionDays },
     });
-    this.#installSignalHandlers(app.log);
+    // Order preserved exactly as before this extraction (audit flushes before the worker drains
+    // in-flight deliveries) — a known, separately tracked defect, not something to fix here.
+    const { shutdown } = Lifecycle.install({
+      forceExitMs: this.config.lockTtlMs,
+      log: app.log,
+      steps: [
+        () => this.app?.close(),
+        () => this.audit.close(),
+        () => this.worker?.stop(),
+        () => { for (const ch of this.channels) ch.close(); },
+        () => this.db.close(),
+      ],
+    });
+    this.shutdown = shutdown;
     this.audit.logger = app.log;
     this.audit.start();
     await app.listen({ port: this.config.port, host: this.config.host });
     app.log.info({ tls: this.config.tls !== null }, this.config.tls ? 'serving HTTPS' : 'serving plain HTTP, terminate TLS at a reverse proxy');
     this.worker.start();
     if (process.send) process.send('ready'); // PM2 wait_ready
-  }
-
-  /**
-   * Stop accepting requests, drain in-flight deliveries, release resources, exit.
-   * @param {string} reason
-   */
-  async shutdown(reason) {
-    if (this.shuttingDown) return;
-    this.shuttingDown = true;
-    const log = /** @type {import('./types.js').Logger} */ (this.app?.log ?? console);
-    log.info({ reason }, 'shutting down');
-    const forceExit = setTimeout(() => {
-      log.error('shutdown timed out, exiting');
-      process.exit(1);
-    }, this.config.lockTtlMs).unref();
-    try {
-      await this.app?.close();
-      await this.audit.close();
-      await this.worker?.stop();
-      for (const ch of this.channels) ch.close();
-      this.db.close();
-      clearTimeout(forceExit);
-      log.info('shutdown complete');
-      process.exit(0);
-    } catch (err) {
-      log.error({ err }, 'shutdown failed');
-      process.exit(1);
-    }
-  }
-
-  /** @param {import('./types.js').Logger} log */
-  #installSignalHandlers(log) {
-    process.on('SIGTERM', () => this.shutdown('SIGTERM'));
-    process.on('SIGINT', () => this.shutdown('SIGINT'));
-    process.on('unhandledRejection', (reason) => {
-      log.fatal({ err: reason }, 'unhandled rejection');
-      this.shutdown('unhandledRejection');
-    });
-    process.on('uncaughtException', (err) => {
-      log.fatal({ err }, 'uncaught exception');
-      process.exit(1);
-    });
   }
 }

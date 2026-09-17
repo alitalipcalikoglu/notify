@@ -1,15 +1,7 @@
-import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { Database as CoreDatabase } from '@atc-web/service-core/db';
 
-/**
- * SQLite connection with schema migrations applied on open.
- */
-export class Database {
-  /**
-   * Ordered, append-only migrations. `PRAGMA user_version` tracks the applied count.
-   * @type {readonly string[]}
-   */
+/** SQLite connection with schema migrations applied on open. */
+export class Database extends CoreDatabase {
   static MIGRATIONS = [
     `
     CREATE TABLE messages (
@@ -36,45 +28,4 @@ export class Database {
     CREATE INDEX messages_retention ON messages (status, updated_at);
     `,
   ];
-
-  /** @param {string} path File path, or ":memory:". */
-  constructor(path) {
-    if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
-    /** @readonly */
-    this.raw = new DatabaseSync(path);
-    this.raw.exec('PRAGMA journal_mode = WAL');
-    this.raw.exec('PRAGMA synchronous = NORMAL');
-    this.raw.exec('PRAGMA busy_timeout = 5000');
-    this.raw.exec('PRAGMA foreign_keys = ON');
-    this.#migrate();
-  }
-
-  #migrate() {
-    const { user_version: current } = /** @type {{ user_version: number }} */ (this.raw.prepare('PRAGMA user_version').get());
-    for (let v = current; v < Database.MIGRATIONS.length; v++) {
-      this.raw.exec('BEGIN');
-      try {
-        this.raw.exec(Database.MIGRATIONS[v]);
-        this.raw.exec(`PRAGMA user_version = ${v + 1}`);
-        this.raw.exec('COMMIT');
-      } catch (err) {
-        this.raw.exec('ROLLBACK');
-        throw err;
-      }
-    }
-  }
-
-  /** @param {string} sql */
-  prepare(sql) {
-    return this.raw.prepare(sql);
-  }
-
-  /** Cheap liveness probe; throws if the connection is unusable. */
-  ping() {
-    this.raw.prepare('SELECT 1').get();
-  }
-
-  close() {
-    this.raw.close();
-  }
 }
