@@ -40,7 +40,7 @@ NOTIFY_API_KEYS=auth:6f1c…,shop:a09e…,gateway:77d2…
 
 ```bash
 pm2 start ecosystem.config.cjs   # reads ./.env
-pm2 reload notify                # zero-downtime: waits for the ready signal
+pm2 reload notify                # restart after a deploy: waits for the app's ready signal
 pm2 logs notify --json
 ```
 

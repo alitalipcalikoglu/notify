@@ -182,6 +182,10 @@ already DB-backed before this split (never read an in-process `Worker` field); a
 
 ## Lease ownership and scaling model
 
+**Scaling class: B — single-node stateful, but "single-node" now means one HOST, not one
+PROCESS.** (See `stack/docs/ARCHITECTURE_AUDIT.md` and `stack/docs/READINESS_TEMPLATE.md` for the
+class definitions.)
+
 Every claimed batch of messages gets a fencing token (`owner_token`) and a lease (`locked_until`,
 the same column this service always had, now fencing-checked on write too). A worker renews the
 lease every `HEARTBEAT_MS` while a send is in flight (`LOCK_TTL_MS`, default 120s; `HEARTBEAT_MS`,
@@ -202,8 +206,8 @@ See [docs/READINESS.md](docs/READINESS.md) for the full contract.
 ## Observability
 
 `notify` accepts and logs whatever `X-Request-Id` a caller sends (generating one when absent) but
-does not yet parse, generate or forward `traceparent` — that is implemented in `gateway` only, per
-the platform's [OBSERVABILITY.md](../stack/docs/OBSERVABILITY.md). Outbound SMTP sends and webhook
+does not yet parse, generate or forward `traceparent` — that is implemented in `gateway` and
+`console`, per the platform's [OBSERVABILITY.md](../stack/docs/OBSERVABILITY.md). Outbound SMTP sends and webhook
 POSTs carry `X-Notify-Id` but no request-id or trace header. See
 [docs/READINESS.md](docs/READINESS.md) for the full contract.
 

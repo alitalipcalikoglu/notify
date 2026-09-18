@@ -287,7 +287,7 @@ body but not echoed into the log line itself).
 
 ## Tracing
 `notify` does not parse, generate, or forward `traceparent`. Per OBSERVABILITY.md, that is
-implemented only in the `gateway` service as of this review's Stage 1; `notify` makes no claim to
+implemented in the `gateway` and `console` services (Stage 10); `notify` makes no claim to
 it. `notify` does already accept and log an inbound `X-Request-Id` (`requestIdHeader:
 'x-request-id'` in `src/app.js`, confirmed by reading the file in this session) — unconditionally,
 with no trust-boundary gate, because `notify` is only ever reached from other internal services,
