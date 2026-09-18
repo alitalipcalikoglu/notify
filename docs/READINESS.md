@@ -280,15 +280,17 @@ field names rather than the OBSERVABILITY.md vocabulary, even where a name happe
 (`durationMs` here is manually computed in `worker.js`, not Fastify's own `responseTime`, which is
 what the vocabulary treats as the equivalent field for HTTP requests).
 
-Fields from the OBSERVABILITY.md vocabulary that `notify` does **not** yet emit: `traceId`,
-`spanId`, a normalised `route`/`op` (only Fastify's implicit `req.url` is available), `upstream` /
-`upstreamMs` (`notify` doesn't proxy), `service`, `version`, and `code` (present in the HTTP error
-body but not echoed into the log line itself).
+Fields from the OBSERVABILITY.md vocabulary that `notify` does **not** yet emit (`traceId`/`spanId`
+are now emitted — see Tracing below): a normalised `route`/`op` (only Fastify's implicit `req.url`
+is available), `upstream` / `upstreamMs` (`notify` doesn't proxy), `service`, `version`, and `code`
+(present in the HTTP error body but not echoed into the log line itself).
 
 ## Tracing
-`notify` does not parse, generate, or forward `traceparent`. Per OBSERVABILITY.md, that is
-implemented in the `gateway` and `console` services (Stage 10); `notify` makes no claim to
-it. `notify` does already accept and log an inbound `X-Request-Id` (`requestIdHeader:
+`notify` parses an inbound `traceparent` via `@atc-web/service-core`'s `registerRequestContext`,
+trust-gated on `TRUST_PROXY` (same boundary as `X-Forwarded-*`, per OBSERVABILITY.md): trusted, the
+caller's trace-id is continued with a fresh span-id for this hop; untrusted or malformed, a fresh
+trace is started. Both `traceId`/`spanId` are logged on every request line (post-production Phase
+5). `notify` does already accept and log an inbound `X-Request-Id` (`requestIdHeader:
 'x-request-id'` in `src/app.js`, confirmed by reading the file in this session) — unconditionally,
 with no trust-boundary gate, because `notify` is only ever reached from other internal services,
 never directly from an untrusted client.

@@ -206,9 +206,12 @@ See [docs/READINESS.md](docs/READINESS.md) for the full contract.
 
 ## Observability
 
-`notify` accepts and logs whatever `X-Request-Id` a caller sends (generating one when absent) but
-does not yet parse, generate or forward `traceparent` — that is implemented in `gateway` and
-`console`, per the platform's [OBSERVABILITY.md](../stack/docs/OBSERVABILITY.md). Outbound SMTP sends and webhook
+`notify` accepts and logs whatever `X-Request-Id` a caller sends (generating one when absent) and
+also parses an inbound `traceparent` via `@atc-web/service-core`'s `registerRequestContext`,
+trust-gated on `TRUST_PROXY` (same boundary as `X-Forwarded-*`): trusted, the caller's trace-id is
+continued with a fresh span-id; untrusted or malformed, a fresh trace is started. Both
+`traceId`/`spanId` are logged on every request line — see the platform's
+[OBSERVABILITY.md](../stack/docs/OBSERVABILITY.md). Outbound SMTP sends and webhook
 POSTs carry `X-Notify-Id` but no request-id or trace header. See
 [docs/READINESS.md](docs/READINESS.md) for the full contract.
 

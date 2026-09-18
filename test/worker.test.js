@@ -110,6 +110,10 @@ test('webhook delivery posts a signed JSON body with the expected headers', asyn
   assert.equal(r.headers['x-tenant'], 't1');
   assert.equal(r.headers.authorization, 'Bearer abc');
   assert.match(String(r.headers['user-agent']), /atc-notify/);
+  // Post-production Phase 5 security regression: notify's webhook channel target is
+  // operator-configured external — never receives platform trace/request-id headers.
+  assert.equal('traceparent' in r.headers, false);
+  assert.equal('x-request-id' in r.headers, false);
   assert.ok(new WebhookSigner(config.webhookSigningSecret).verify(r.body, String(r.headers[WebhookSigner.HEADER])));
   const parsed = JSON.parse(r.body);
   assert.equal(parsed.id, row.id);
