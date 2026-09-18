@@ -402,9 +402,11 @@ worker processes against the same `DB_PATH` file (Stage 6's split-deployment top
 supported configuration: claims still never double-deliver the same row, and a crash in one worker
 is now reclaimed by any live sibling, not only by that same process restarting — the difference
 Stage 6 makes. Both/all instances compete for the same claim batches under real SQLite write-lock
-serialization (not corruption, just contention under very high claim rates), and a simultaneous
-first boot against a brand-new, empty database file still races the migration step unguarded — start
-one instance first, let it complete its migration, before scaling out workers against that file.
+serialization (not corruption, just contention under very high claim rates). A simultaneous first
+boot of two or more instances against a brand-new (or pending-migration) database file is
+migration-safe as of `@atc-web/service-core` v1.10.1 (post-production Phase 1) — no staggered-start
+workaround is needed; see `stack/docs/UPGRADE.md`'s "Worker-split rollout ordering" for the exact
+guarantee and its boundary (same host, local SQLite file only).
 
 ## Known failure modes
 - **Disk full.** A SQLite write (`INSERT`/`UPDATE`, including a WAL checkpoint) throws from
@@ -436,6 +438,5 @@ one instance first, let it complete its migration, before scaling out workers ag
   way — the buffer is in-memory only, never persisted to disk; unaffected by Stage 6.
 - **Multiple worker processes running against one file.** Stage 6: now a supported topology (see
   "Scaling model"), not a failure mode — listed here only to be explicit that it no longer is one.
-  The remaining, expected cost under high contention is write-lock contention
-  (`busy_timeout = 5000` ms), and an unguarded migration race specifically at simultaneous first
-  boot against a brand-new database file (see "Scaling model").
+  The remaining, expected cost under high contention is write-lock contention (`busy_timeout = 5000`
+  ms) during normal runtime; the startup migration race is closed (see "Scaling model").
