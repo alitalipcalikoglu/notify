@@ -1,3 +1,4 @@
+import { createServer } from 'node:net';
 import { EmailChannel } from '../src/channels/email.js';
 import { Config } from '../src/config.js';
 import { Database } from '../src/db.js';
@@ -10,6 +11,24 @@ import { WebhookChannel, WebhookSigner } from '../src/channels/webhook.js';
 export const API_KEY = 'k'.repeat(40);
 export const OTHER_KEY = 'o'.repeat(40);
 export const WEBHOOK_SECRET = 's'.repeat(40);
+
+/**
+ * An OS-assigned free TCP port, so a test that actually binds `PORT` (unlike most of this suite,
+ * which never starts a real listener) never collides with whatever else happens to be running on
+ * the host. `notify`'s own `PORT` validator requires >=1 (unlike a few sibling services), so `'0'`
+ * itself is not a valid override here — a real, already-free port number is required instead.
+ * @returns {Promise<number>}
+ */
+export function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const port = /** @type {import('node:net').AddressInfo} */ (srv.address()).port;
+      srv.close((err) => (err ? reject(err) : resolve(port)));
+    });
+  });
+}
 
 /**
  * Test configuration: in-memory DB, JSON mail transport, http webhooks allowed, tiny backoff.

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Application } from '../src/application.js';
-import { testConfig } from './helpers.js';
+import { freePort, testConfig } from './helpers.js';
 
 /**
  * `Application.start()` end to end for each role, without going through `Lifecycle`'s `shutdown()`
@@ -16,7 +16,7 @@ async function cleanup(/** @type {Application} */ app) {
 }
 
 test('Runtime: api-only role builds no Worker; the process never claims a message', async () => {
-  const app = new Application(testConfig(), { role: 'api' });
+  const app = new Application(testConfig({ PORT: String(await freePort()) }), { role: 'api' });
   await app.start();
   try {
     assert.equal(app.worker, null);
@@ -30,7 +30,7 @@ test('Runtime: api-only role builds no Worker; the process never claims a messag
 });
 
 test('Runtime: worker-only role builds no HTTP listener but still processes messages', async () => {
-  const app = new Application(testConfig(), { role: 'worker' });
+  const app = new Application(testConfig({ PORT: String(await freePort()) }), { role: 'worker' });
   await app.start();
   try {
     assert.equal(app.app, null, 'no Fastify instance at all');
@@ -44,7 +44,7 @@ test('Runtime: worker-only role builds no HTTP listener but still processes mess
 });
 
 test('Runtime: shutdown order — stop claiming, then HTTP intake, then drain in-flight, then close channels, then audit flush, then DB close', async () => {
-  const app = new Application(testConfig(), { role: 'combined' });
+  const app = new Application(testConfig({ PORT: String(await freePort()) }), { role: 'combined' });
   await app.start();
   /** @type {string[]} */
   const order = [];
