@@ -1,0 +1,784 @@
+openapi: 3.1.0
+info:
+  title: notify
+  version: 1.0.0
+  description: >-
+    Notification service for the atc-web platform: accepts email and signed-webhook messages over
+    HTTP, persists them to a durable queue, and delivers them asynchronously through a separate
+    worker process. Callers poll message status by id or list; delivery is never synchronous with
+    the create call.
+
+servers:
+  - url: /
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: messages
+    description: Queued email/webhook messages and their delivery status.
+  - name: templates
+    description: Email templates bundled with this service.
+  - name: operations
+    description: Liveness, readiness, service identity and metrics.
+
+paths:
+  /health:
+    get:
+      operationId: notify.health.get
+      summary: Liveness probe
+      description: >-
+        Always returns 200 with no dependency check. Does not require authentication and is never
+        rate limited.
+      tags: [operations]
+      security: []
+      x-stack-visibility: public
+      responses:
+        '200':
+          description: Process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthOk'
+
+  /ready:
+    get:
+      operationId: notify.ready.get
+      summary: Readiness probe
+      description: >-
+        Runs a dependency check (database ping, then `verify()` on every configured delivery
+        channel) and caches the result for `NotifyApi.READY_CACHE_MS` (30 seconds). Also reports
+        whether a worker process is currently alive, inferred from a recent `worker_heartbeat` row
+        (this API process never runs an in-process Worker itself). Does not require authentication
+        and is never rate limited.
+      tags: [operations]
+      security: []
+      x-stack-visibility: public
+      responses:
+        '200':
+          description: Dependencies are healthy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyOk'
+        '503':
+          description: A dependency check failed (database unreachable, or a channel's `verify()` threw).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyUnavailable'
+
+  /v1/info:
+    get:
+      operationId: notify.info.get
+      summary: Service identity and capabilities
+      description: >-
+        Public, unauthenticated, uncached. `capabilities` is computed live from the channels
+        actually wired into this instance: it drops `"webhook"` when `NOTIFY_WEBHOOK_CHANNEL=false`
+        (Stage 7), so it always reflects real, currently-enabled behavior rather than a static list.
+      tags: [operations]
+      security: []
+      x-stack-visibility: public
+      responses:
+        '200':
+          description: Service identity.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InfoResponse'
+
+  /metrics:
+    get:
+      operationId: notify.metrics.get
+      summary: Prometheus metrics
+      description: >-
+        Prometheus text exposition format. Requires the same Bearer API key as `/v1/*`, but is
+        registered outside the `/v1` rate-limit plugin scope and is therefore never rate limited
+        (a deliberate, platform-wide convention so a fixed-schedule scraper is never throttled).
+      tags: [operations]
+      x-stack-visibility: operational
+      responses:
+        '200':
+          description: Prometheus text exposition (`notify_messages`, `notify_oldest_queued_age_seconds`, `notify_worker_up`, `notify_process_uptime_seconds`).
+          content:
+            text/plain:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/messages:
+    post:
+      operationId: notify.messages.create
+      summary: Queue a message for delivery
+      description: >-
+        Inserts the message and returns immediately (`202` for a newly-created message, `200` when
+        the request replays an existing `idempotencyKey`); actual delivery happens later, out of
+        band, via the worker process. Body is polymorphic on `channel` (`email` or `webhook`); an
+        `email` body's `data` is additionally validated, at request time, against the named
+        template's own JSON Schema (`GET /v1/templates` lists the templates this instance ships
+        with, each with its schema).
+
+        **Idempotency**: `idempotencyKey`, when given, scopes one logical send per API key. Reusing
+        a key with the identical channel and payload replays the original row (`200`); reusing it
+        with a different channel or payload is a conflict (`409 IDEMPOTENCY_CONFLICT`) — the key is
+        not a slot to overwrite.
+
+        **State machine**: `queued -> processing -> sent | failed`. A `failed` message is retryable
+        exactly once per call via `POST /v1/messages/{id}/retry` (full attempt-budget reset, not
+        automatic); there is no cancel/abort endpoint. Automatic retries use exponential backoff
+        with jitter (`BACKOFF_BASE_MS`, default 5000ms; `BACKOFF_CAP_MS`, default 3600000ms) up to
+        `MAX_ATTEMPTS` attempts (default 8) before a message is settled as `failed`.
+      tags: [messages]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/MessageCreateEmail'
+                - $ref: '#/components/schemas/MessageCreateWebhook'
+              discriminator:
+                propertyName: channel
+                mapping:
+                  email: '#/components/schemas/MessageCreateEmail'
+                  webhook: '#/components/schemas/MessageCreateWebhook'
+      responses:
+        '200':
+          description: Idempotent replay — an existing message with the same `idempotencyKey`, channel and payload was returned unchanged.
+          headers:
+            location: { $ref: '#/components/headers/Location' }
+            x-ratelimit-limit: { $ref: '#/components/headers/RateLimitLimit' }
+            x-ratelimit-remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            x-ratelimit-reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '202':
+          description: New message accepted and queued for delivery.
+          headers:
+            location: { $ref: '#/components/headers/Location' }
+            x-ratelimit-limit: { $ref: '#/components/headers/RateLimitLimit' }
+            x-ratelimit-remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            x-ratelimit-reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          description: >-
+            `VALIDATION_FAILED` — the body failed JSON Schema validation (unknown/missing field,
+            wrong `channel` discriminator, malformed email/URL/event name, disallowed webhook
+            header name, etc.), or an `email` message's `data` failed the named template's own
+            schema (`details[].path` is prefixed `/data`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: '`WEBHOOK_CHANNEL_DISABLED` — `channel: "webhook"` was submitted while this instance runs with `NOTIFY_WEBHOOK_CHANNEL=false`.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '409':
+          description: '`IDEMPOTENCY_CONFLICT` — `idempotencyKey` was already used by this API key with a different channel or payload.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '413':
+          description: >-
+            Request body exceeded `BODY_LIMIT` (default 65536 bytes). Raised by Fastify's own
+            content-type parser before route validation runs (`FST_ERR_CTP_BODY_TOO_LARGE`), so the
+            envelope carries that code rather than a notify-defined one.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    get:
+      operationId: notify.messages.list
+      summary: List this API key's messages
+      description: >-
+        Cursor-paginated, newest first (`created_at DESC, id DESC`). Only returns messages created
+        under the caller's own API key. No Fastify `response:` schema is declared for this route at
+        the source level; the shape below is derived directly from the handler's real return value.
+      tags: [messages]
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/MessageStatus'
+        - name: limit
+          in: query
+          description: 1-100. Defaults to 20 when omitted.
+          schema:
+            type: string
+            pattern: '^([1-9]|[1-9][0-9]|100)$'
+        - name: cursor
+          in: query
+          description: Opaque pagination cursor from a previous response's `nextCursor`.
+          schema:
+            type: string
+            maxLength: 128
+      responses:
+        '200':
+          description: A page of messages.
+          headers:
+            x-ratelimit-limit: { $ref: '#/components/headers/RateLimitLimit' }
+            x-ratelimit-remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            x-ratelimit-reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageList'
+        '400':
+          description: >-
+            `VALIDATION_FAILED` (malformed `status`/`limit`/`cursor` value per the query schema) or
+            `INVALID_CURSOR` (a `cursor` that passed schema validation but does not decode to a real
+            pagination position).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/messages/{id}:
+    get:
+      operationId: notify.messages.get
+      summary: Get one message
+      description: >-
+        Scoped to the caller's own API key — a message id belonging to a different key is reported
+        as `404`, identically to an unknown id. No Fastify `response:` schema is declared for `200`
+        at the source level; the shape below is derived directly from `MessageView.from()`.
+      tags: [messages]
+      parameters:
+        - $ref: '#/components/parameters/MessageId'
+      responses:
+        '200':
+          description: The message.
+          headers:
+            x-ratelimit-limit: { $ref: '#/components/headers/RateLimitLimit' }
+            x-ratelimit-remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            x-ratelimit-reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          description: '`VALIDATION_FAILED` — `id` is not a UUID.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/messages/{id}/retry:
+    post:
+      operationId: notify.messages.retry
+      summary: Manually re-queue a failed message
+      description: >-
+        Only a message in `failed` status can be retried. On success, resets `attempts` to 0 and
+        `status` to `queued` for an immediate delivery attempt (a full attempt-budget reset against
+        the same `maxAttempts` the message was created with) — this is not itself counted as a
+        delivery attempt. Scoped to the caller's own API key.
+      tags: [messages]
+      parameters:
+        - $ref: '#/components/parameters/MessageId'
+      responses:
+        '200':
+          description: Message re-queued.
+          headers:
+            x-ratelimit-limit: { $ref: '#/components/headers/RateLimitLimit' }
+            x-ratelimit-remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            x-ratelimit-reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          description: '`VALIDATION_FAILED` — `id` is not a UUID.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: '`NOT_RETRYABLE` — the message exists but is not in `failed` status (it is `queued`, `processing` or already `sent`).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/templates:
+    get:
+      operationId: notify.templates.list
+      summary: List email templates
+      description: >-
+        The email templates bundled with this service (`TemplateRegistry.withDefaults()`): fixed,
+        code-shipped templates, not operator-configurable. As of this version there are exactly
+        three — `email-verification`, `password-reset`, `generic` — each with its own JSON Schema
+        for the `data` field an email-channel `POST /v1/messages` body must satisfy.
+      tags: [templates]
+      responses:
+        '200':
+          description: All templates this instance ships with.
+          headers:
+            x-ratelimit-limit: { $ref: '#/components/headers/RateLimitLimit' }
+            x-ratelimit-remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            x-ratelimit-reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TemplateList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        `Authorization: Bearer <secret>`. Keys come from `NOTIFY_API_KEYS` (`id:secret,id2:secret2`);
+        every configured key is compared in constant time (SHA-256 + timing-safe equality, no early
+        exit), so timing never reveals whether, or which, key matched. notify's keys carry no role —
+        any valid key can use every `/v1/*` route and `/metrics`.
+
+  parameters:
+    MessageId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  headers:
+    Location:
+      description: Path of the created/replayed message, for polling (`GET /v1/messages/{id}`).
+      schema:
+        type: string
+        example: /v1/messages/2b1f7e3a-1c2d-4e5f-9a6b-7c8d9e0f1a2b
+    RateLimitLimit:
+      description: Requests allowed per rolling one-minute window for this API key (`RATE_LIMIT_MAX`, default 600).
+      schema:
+        type: integer
+    RateLimitRemaining:
+      description: Requests remaining in the current window for this API key.
+      schema:
+        type: integer
+    RateLimitReset:
+      description: Seconds until the current window resets.
+      schema:
+        type: integer
+    RetryAfter:
+      description: Seconds to wait before retrying, present only once the per-key rate limit has been exceeded.
+      schema:
+        type: integer
+
+  responses:
+    Unauthorized:
+      description: '`UNAUTHORIZED` — missing or invalid Bearer API key.'
+      headers:
+        www-authenticate:
+          schema:
+            type: string
+            example: Bearer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    NotFound:
+      description: '`NOT_FOUND` — no message with this id exists under the caller''s API key.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    RateLimited:
+      description: '`RATE_LIMITED` — this API key exceeded `RATE_LIMIT_MAX` requests in the current one-minute window.'
+      headers:
+        retry-after: { $ref: '#/components/headers/RetryAfter' }
+        x-ratelimit-limit: { $ref: '#/components/headers/RateLimitLimit' }
+        x-ratelimit-remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+        x-ratelimit-reset: { $ref: '#/components/headers/RateLimitReset' }
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    InternalError:
+      description: '`INTERNAL_ERROR` — an unclassified server-side failure. The message is never a leaked internal detail.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable machine-readable error code, e.g. `VALIDATION_FAILED`, `NOT_FOUND`, `IDEMPOTENCY_CONFLICT`.
+            message:
+              type: string
+            details:
+              type: array
+              description: Present for `VALIDATION_FAILED`; one entry per failed constraint.
+              items:
+                type: object
+                properties:
+                  path:
+                    type: string
+                    description: JSON pointer into the request (e.g. `/to/0`, `/data/appName`).
+                  message:
+                    type: string
+                  params:
+                    type: object
+                    additionalProperties: true
+                additionalProperties: true
+
+    HealthOk:
+      type: object
+      required: [status]
+      properties:
+        status:
+          const: ok
+
+    ReadyOk:
+      type: object
+      required: [status, worker]
+      properties:
+        status:
+          const: ok
+        worker:
+          type: string
+          enum: [running, stopped]
+          description: >-
+            `running` if a `worker_heartbeat` row was written within `HEARTBEAT_MS x 4` of now,
+            else `stopped`. This API process has no in-process worker to ask directly.
+
+    ReadyUnavailable:
+      type: object
+      required: [status, error]
+      properties:
+        status:
+          const: unavailable
+        error:
+          type: string
+
+    InfoResponse:
+      type: object
+      required: [service, version, apiVersion, capabilities, schemaVersion, serviceCore]
+      properties:
+        service:
+          const: notify
+        version:
+          type: string
+          description: This service's own package.json semver.
+        apiVersion:
+          const: v1
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: >-
+            Real, currently-enabled behaviors only. Always includes `templates` and `idempotency`;
+            includes `email` when the email channel is configured, and `webhook` unless
+            `NOTIFY_WEBHOOK_CHANNEL=false`.
+          example: [email, webhook, templates, idempotency]
+        schemaVersion:
+          type: integer
+          description: Current SQLite `PRAGMA user_version` for this instance's database.
+        serviceCore:
+          type: string
+          description: Version of the `@atc-web/service-core` package this instance is running.
+
+    MessageStatus:
+      type: string
+      enum: [queued, processing, sent, failed]
+
+    Message:
+      type: object
+      description: Public view of a queued message. Template `data` is never exposed (it may hold PII).
+      required:
+        - id
+        - channel
+        - status
+        - template
+        - event
+        - to
+        - url
+        - attempts
+        - maxAttempts
+        - nextAttemptAt
+        - lastError
+        - providerId
+        - createdAt
+        - updatedAt
+        - sentAt
+      properties:
+        id:
+          type: string
+          format: uuid
+        channel:
+          type: string
+          enum: [email, webhook]
+        status:
+          $ref: '#/components/schemas/MessageStatus'
+        template:
+          type: [string, 'null']
+          description: 'Template name. Populated for `channel: email` only; `null` for `webhook`.'
+        event:
+          type: [string, 'null']
+          description: 'Event name. Populated for `channel: webhook` only; `null` for `email`.'
+        to:
+          type: [array, 'null']
+          items:
+            type: string
+          description: 'Recipient addresses. Populated for `channel: email` only; `null` for `webhook`.'
+        url:
+          type: [string, 'null']
+          description: 'Target URL. Populated for `channel: webhook` only; `null` for `email`.'
+        attempts:
+          type: integer
+          description: Delivery attempts made so far.
+        maxAttempts:
+          type: integer
+          description: Attempt budget this message was created with (`MAX_ATTEMPTS`, default 8).
+        nextAttemptAt:
+          type: [string, 'null']
+          format: date-time
+          description: Next scheduled delivery attempt. Only set while `status` is `queued`; `null` otherwise.
+        lastError:
+          type: [string, 'null']
+          description: Error from the most recent failed attempt, truncated to 2000 characters.
+        providerId:
+          type: [string, 'null']
+          description: Provider reference from the successful attempt (SMTP message id, or `http <status>` for a webhook), once `status` is `sent`.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        sentAt:
+          type: [string, 'null']
+          format: date-time
+
+    MessageList:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+        nextCursor:
+          type: [string, 'null']
+          description: Opaque cursor for the next page, or `null` when this is the last page.
+
+    MessageCreateEmail:
+      type: object
+      additionalProperties: false
+      required: [channel, template, to, data]
+      properties:
+        channel:
+          const: email
+        template:
+          type: string
+          enum: [email-verification, password-reset, generic]
+          description: >-
+            Must name a template returned by `GET /v1/templates`. This enum reflects the exact
+            fixed set of templates `TemplateRegistry.withDefaults()` ships as of this version; a
+            future template addition would extend it.
+        to:
+          $ref: '#/components/schemas/EmailList'
+        cc:
+          $ref: '#/components/schemas/EmailList'
+        bcc:
+          $ref: '#/components/schemas/EmailList'
+        replyTo:
+          type: string
+          format: email
+          maxLength: 254
+        data:
+          type: object
+          description: >-
+            Validated server-side against the named template's own JSON Schema (see the `if`/`then`
+            branches below, one per template, and `GET /v1/templates` for the same schemas at
+            runtime). `locale` defaults to `tr` when omitted on every template.
+        idempotencyKey:
+          $ref: '#/components/schemas/IdempotencyKey'
+      allOf:
+        - if:
+            properties:
+              template: { const: email-verification }
+            required: [template]
+          then:
+            properties:
+              data:
+                type: object
+                additionalProperties: false
+                required: [appName, verifyUrl, expiresInMinutes]
+                properties:
+                  locale: { type: string, enum: [tr, en], default: tr }
+                  appName: { type: string, minLength: 1, maxLength: 80 }
+                  name: { type: string, minLength: 1, maxLength: 200 }
+                  verifyUrl: { type: string, format: uri, pattern: '^https?://', maxLength: 2048 }
+                  expiresInMinutes: { type: integer, minimum: 1, maximum: 10080 }
+        - if:
+            properties:
+              template: { const: password-reset }
+            required: [template]
+          then:
+            properties:
+              data:
+                type: object
+                additionalProperties: false
+                required: [appName, resetUrl, expiresInMinutes]
+                properties:
+                  locale: { type: string, enum: [tr, en], default: tr }
+                  appName: { type: string, minLength: 1, maxLength: 80 }
+                  name: { type: string, minLength: 1, maxLength: 200 }
+                  resetUrl: { type: string, format: uri, pattern: '^https?://', maxLength: 2048 }
+                  expiresInMinutes: { type: integer, minimum: 1, maximum: 10080 }
+                  requestIp: { type: string, maxLength: 45, pattern: '^[0-9a-fA-F.:]+$' }
+        - if:
+            properties:
+              template: { const: generic }
+            required: [template]
+          then:
+            properties:
+              data:
+                type: object
+                additionalProperties: false
+                required: [appName, subject, title, paragraphs]
+                properties:
+                  locale: { type: string, enum: [tr, en], default: tr }
+                  appName: { type: string, minLength: 1, maxLength: 80 }
+                  subject: { type: string, minLength: 1, maxLength: 200 }
+                  title: { type: string, minLength: 1, maxLength: 200 }
+                  paragraphs:
+                    type: array
+                    minItems: 1
+                    maxItems: 20
+                    items: { type: string, minLength: 1, maxLength: 2000 }
+                  button:
+                    type: object
+                    additionalProperties: false
+                    required: [label, url]
+                    properties:
+                      label: { type: string, minLength: 1, maxLength: 60 }
+                      url: { type: string, format: uri, pattern: '^https?://', maxLength: 2048 }
+                  footnote: { type: string, maxLength: 500 }
+
+    MessageCreateWebhook:
+      type: object
+      additionalProperties: false
+      required: [channel, url, event, data]
+      properties:
+        channel:
+          const: webhook
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+          description: HTTP(S) target. Resolved through an SSRF guard at delivery time; redirects are not followed.
+        event:
+          type: string
+          minLength: 1
+          maxLength: 100
+          pattern: '^[a-zA-Z0-9_.:-]+$'
+        data:
+          type: object
+          description: >-
+            Free-form JSON, opaque to notify — sent verbatim as the delivered payload's `data`
+            field. No further schema is enforced (unlike the `email` channel's per-template `data`).
+        headers:
+          type: object
+          maxProperties: 10
+          propertyNames:
+            pattern: '^([Xx]-[A-Za-z0-9-]{1,60}|[Aa]uthorization)$'
+          additionalProperties:
+            type: string
+            maxLength: 1024
+            pattern: '^[\x20-\x7E]*$'
+          description: Extra outbound request headers. Only `X-*` and `Authorization` names are allowed; values must be single-line printable ASCII (no CR/LF).
+        idempotencyKey:
+          $ref: '#/components/schemas/IdempotencyKey'
+
+    EmailList:
+      type: array
+      minItems: 1
+      maxItems: 10
+      uniqueItems: true
+      items:
+        type: string
+        format: email
+        maxLength: 254
+
+    IdempotencyKey:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^[\x21-\x7E]+$'
+      description: Scopes one logical send per API key. Reusing it with an identical channel+payload replays the original message; reusing it with a different one is a `409 IDEMPOTENCY_CONFLICT`.
+
+    TemplateDescriptor:
+      type: object
+      required: [name, description, schema]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        schema:
+          type: object
+          description: JSON Schema for this template's `data` field, as used to validate `POST /v1/messages`.
+          additionalProperties: true
+
+    TemplateList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TemplateDescriptor'
