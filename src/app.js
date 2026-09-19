@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
 import { AuditClient } from '@atc-web/service-core/audit';
-import { registerInfo, registerProbes, registerRequestContext, requestOptions } from '@atc-web/service-core/fastify';
+import { registerInfo, registerOpenApi, registerProbes, registerRequestContext, requestOptions } from '@atc-web/service-core/fastify';
 import { ApiKeyAuth } from './auth.js';
 import { DisabledChannel } from './channels/disabled.js';
 import { IdempotencyConflictError, InvalidCursorError } from './queue.js';
@@ -198,6 +198,7 @@ export class NotifyApi {
       this.queue.db.ping();
       for (const ch of this.channels) await ch.verify();
     }, { cacheMs: NotifyApi.READY_CACHE_MS, extra: () => ({ worker: this.workerStatus() }) });
+    registerOpenApi(app, new URL('../openapi.yaml', import.meta.url));
     registerInfo(app, {
       service: 'notify',
       version: this.version,

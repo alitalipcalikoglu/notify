@@ -10,6 +10,7 @@ WORKDIR /app
 RUN mkdir -p /data && chown node:node /data
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json ./
+COPY openapi.yaml ./
 COPY src ./src
 USER node
 VOLUME ["/data"]

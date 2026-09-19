@@ -23,6 +23,19 @@ tags:
     description: Liveness, readiness, service identity and metrics.
 
 paths:
+  /openapi.yaml:
+    get:
+      operationId: notify.openapi
+      summary: Download the canonical OpenAPI document
+      description: Returns this service's repository-root OpenAPI 3.1 document byte-for-byte.
+      security: []
+      responses:
+        "200":
+          description: Canonical OpenAPI document.
+          content:
+            text/yaml:
+              schema: { type: string }
+
   /health:
     get:
       operationId: notify.health.get

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { after, before, test } from 'node:test';
 import { NotifyApi } from '../src/app.js';
 import { API_KEY, emailBody, OTHER_KEY, silentLog, templates, testConfig, testEmailChannel, testPresence, testQueue } from './helpers.js';
@@ -21,6 +22,9 @@ test('health and readiness are public', async () => {
   assert.equal((await app.inject('/health')).statusCode, 200);
   const ready = await app.inject('/ready');
   assert.equal(ready.statusCode, 200);
+  const spec = await app.inject('/openapi.yaml');
+  assert.equal(spec.body, readFileSync(new URL('../openapi.yaml', import.meta.url), 'utf8'));
+  assert.match(String(spec.headers['content-type']), /^text\/yaml/);
   assert.deepEqual(ready.json(), { status: 'ok', worker: 'stopped' }, 'no worker_heartbeat row: reads as stopped, Stage 6');
   presence.beat(Date.now());
   assert.deepEqual((await app.inject('/ready')).json(), { status: 'ok', worker: 'running' }, 'a recent heartbeat reads as running even with no in-process Worker');
