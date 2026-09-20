@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: notify
-  version: 1.0.0
+  version: 1.1.0
   description: >-
     Notification service for the atc-web platform: accepts email and signed-webhook messages over
     HTTP, persists them to a durable queue, and delivers them asynchronously through a separate
