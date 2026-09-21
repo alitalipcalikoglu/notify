@@ -1,6 +1,6 @@
 {
   "name": "@atc-web/notify",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "description": "Notification service: queued email and signed webhook delivery over HTTP",
   "license": "MIT",
